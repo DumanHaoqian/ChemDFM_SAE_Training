@@ -33,13 +33,17 @@ run_layer_sweep.py train+eval one SAE per cached layer -> sweep_summary.json
 ## Train
 
 ```bash
-cd Stage4_sae_training
-# main line: BatchTopK on layer 26
-python train_sae.py --layer 26 --arch batchtopk --expansion 16 --k 32 \
-    --total-steps 30000 --no-wandb
+cd /home/haoqian/Data/Graph/SAERAG_Stage4
 
-# tiny end-to-end validation
-python train_sae.py --smoke --layer 26
+# Config-first main line. configs/train.yaml defaults to train_gpu=6, eval=true,
+# eval_gpu=7, eval_per_step=500, and eval_batch_size=2. CLI flags override.
+python train_sae.py --config configs/train.yaml
+
+# Example override for a short run while keeping the config defaults.
+python train_sae.py --config configs/train.yaml --total-steps 1000 --run-name debug_1000
+
+# tiny end-to-end validation; smoke disables periodic Delta LM eval.
+python train_sae.py --smoke --layer 26 --no-wandb
 ```
 
 Output (`output/<run_name>/`): `sae_weights.safetensors` + `cfg.json`

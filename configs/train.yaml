@@ -1,10 +1,45 @@
-# Stage 4 SAE training reference config (CLI flags override).
-# Main line: BatchTopK on the residual stream (§2.2). Empirical starting points
-# from the design (§2.2), to be sweept later against downstream detection AUC.
-arch: batchtopk        # batchtopk | topk | jumprelu | matryoshka
-layer: 26              # main SAE layer (Stage 1 selection)
-expansion: 16          # d_sae = 16 * 5120 = 81920 latents
-k: 32                  # target L0 (avg active latents); try 32-64
-lr: 1.0e-4
-total_steps: 30000
-batch_s
+# Stage 4 SAE training config. CLI flags override these values.
+
+# ----- training placement -----
+train_gpu: 6            # Physical GPU id used for SAE training; train_sae.py sets CUDA_VISIBLE_DEVICES to this id.
+
+# ----- output / logging / checkpoints -----
+output_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/output      # Final run outputs: SAE weights, cfg.json, training_meta.json.
+log_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/logs           # train_sae.py tees stdout/stderr here in addition to nohup/screen output.
+log_file: null             # Optional explicit log file; null auto-generates from run_name or timestamp.
+checkpoint_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/checkpoints # Persistent checkpoint root; checkpoints are stored under checkpoint_dir/run_name/.
+ckpt_every: 1000           # Save a persistent checkpoint every N steps; 0 disables persistent train checkpoints.
+
+# ----- W&B -----
+wandb: true                # If true, log train metrics and periodic eval metrics to W&B. Use --no-wandb to override.
+wandb_project: chem_sae    # W&B project name.
+wandb_entity: null         # Optional W&B entity/team; null uses the logged-in default.
+wandb_run_name: null       # Optional W&B run display name; null uses run_name.
+
+# ----- SAE architecture / optimization -----
+arch: batchtopk         # SAE architecture: batchtopk | topk | jumprelu | matryoshka.
+layer: 26               # ChemDFM decoder layer whose resid_post activations are reconstructed by the SAE.
+expansion: 16           # d_sae = expansion * d_in; ChemDFM d_in=5120 so 16x gives 81920 latents.
+k: 32                   # Target L0 / active latents per token for TopK-style SAEs.
+init: asi               # Initialization: default or asi (Active Subspace Initialization).
+lr: 1.0e-4              # Adam learning rate after warmup.
+total_steps: 30000      # Total SAE optimizer steps.
+batch_size: 4096        # Activation rows per SAE optimizer step.
+train_block_rows: 32768 # NAS-friendly contiguous rows loaded per shuffled training block.
+decoder_init_norm: 0.1  # Initial decoder row norm.
+dead_window: 2000000    # Tokens without firing before a latent is counted dead.
+holdout_rows: 50000     # Activation rows reserved from the tail for reconstruction eval.
+log_every: 50           # Training metrics are printed/logged to W&B every N steps.
+run_name: null          # Optional explicit run name; null uses train_sae.py's default.
+
+# ----- periodic Delta LM loss eval -----
+eval: true              # If true, start a persistent eval worker on eval_gpu during training.
+eval_gpu: 7             # Physical GPU id for the eval worker; it preloads ChemDFM and waits for checkpoints.
+eval_per_step: 500      # Run Delta LM loss every N completed SAE training steps.
+eval_batch_size: 2      # Text batch size for Delta LM loss forward passes.
+eval_n_eval_seqs: 32    # Number of fixed holdout text sequences for each Delta LM loss measurement.
+eval_max_length: 128    # Max token length per holdout text during Delta LM loss eval.
+eval_model: chemdfm     # model_config registry name used by the eval worker.
+eval_timeout_sec: 3600  # At training end, wait up to this many seconds for pending eval jobs.
+eval_poll_interval: 5.0 # Seconds between filesystem polls by the eval worker.
+eval_keep_checkpoints: false # If false, delete intermediate eval checkpoints after their result is logged.

@@ -31,11 +31,52 @@ import argparse
 import json
 import math
 import os
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict
 
 import torch
+
+
+class Tee:
+    """Write stdout/stderr both to the terminal/nohup stream and a configured log file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_file_logging(log_dir: str | None, log_file: str | None, run_name: str | None) -> Path | None:
+    """Optionally tee stdout/stderr to a config-defined log file."""
+    if not log_dir:
+        return None
+    log_root = Path(log_dir)
+    log_root.mkdir(parents=True, exist_ok=True)
+    if log_file:
+        log_path = Path(log_file)
+        if not log_path.is_absolute():
+            log_path = log_root / log_path
+    else:
+        safe_name = run_name or time.strftime("train_%Y%m%d_%H%M%S")
+        log_path = log_root / f"{safe_name}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = log_path.open("a", encoding="utf-8")
+    sys.stdout = Tee(sys.stdout, fh)
+    sys.stderr = Tee(sys.stderr, fh)
+    print(f"[log] tee stdout/stderr -> {log_path}")
+    return log_path
 
 import paths
 from data import ActivationStore
@@ -123,6 +164,153 @@ def batch_metrics(sae_in: torch.Tensor, sae_out: torch.Tensor,
     return {"fvu": fvu, "l0": l0}
 
 
+
+
+# ---------------------------------------------------------------------------
+# periodic Delta LM loss evaluation on a second GPU
+# ---------------------------------------------------------------------------
+class PeriodicDeltaLmEvaluator:
+    """Launch and coordinate a persistent Delta LM loss worker process."""
+
+    def __init__(
+        self,
+        out_dir: Path,
+        layer: int,
+        eval_gpu: int,
+        eval_per_step: int,
+        eval_batch_size: int,
+        eval_n_eval_seqs: int,
+        eval_max_length: int,
+        eval_model: str,
+        eval_timeout_sec: int,
+        eval_poll_interval: float,
+        eval_keep_checkpoints: bool,
+    ):
+        self.out_dir = Path(out_dir)
+        self.layer = int(layer)
+        self.eval_gpu = int(eval_gpu)
+        self.eval_per_step = int(eval_per_step)
+        self.eval_timeout_sec = int(eval_timeout_sec)
+        self.eval_keep_checkpoints = bool(eval_keep_checkpoints)
+        self.root = self.out_dir / "delta_lm_eval"
+        self.request_dir = self.root / "requests"
+        self.response_dir = self.root / "responses"
+        self.stop_file = self.root / "STOP"
+        self.log_path = self.root / "eval_worker.log"
+        self.pending: Dict[str, Dict[str, Any]] = {}
+        self.proc: subprocess.Popen | None = None
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.request_dir.mkdir(parents=True, exist_ok=True)
+        self.response_dir.mkdir(parents=True, exist_ok=True)
+        for d in (self.request_dir, self.response_dir):
+            for stale in list(d.glob("*.json")) + list(d.glob("*.tmp")):
+                stale.unlink(missing_ok=True)
+        if self.stop_file.exists():
+            self.stop_file.unlink()
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(self.eval_gpu)
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("eval_worker.py")),
+            "--request-dir", str(self.request_dir),
+            "--response-dir", str(self.response_dir),
+            "--stop-file", str(self.stop_file),
+            "--model", eval_model,
+            "--n-eval-seqs", str(eval_n_eval_seqs),
+            "--max-length", str(eval_max_length),
+            "--batch-size", str(eval_batch_size),
+            "--poll-interval", str(eval_poll_interval),
+        ]
+        self._log_fh = self.log_path.open("a", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            cmd,
+            cwd=str(Path(__file__).parent),
+            env=env,
+            stdout=self._log_fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        print(f"[eval] worker pid={self.proc.pid} gpu={self.eval_gpu} log={self.log_path}")
+
+    def enqueue(self, step: int, run_dir: Path) -> None:
+        request_id = f"step_{int(step):06d}"
+        payload = {
+            "request_id": request_id,
+            "step": int(step),
+            "run_dir": str(Path(run_dir).resolve()),
+            "layer": self.layer,
+            "created_at": time.time(),
+        }
+        tmp = self.request_dir / f"{request_id}.tmp"
+        final = self.request_dir / f"{request_id}.json"
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(final)
+        self.pending[request_id] = {
+            "step": int(step),
+            "run_dir": str(run_dir),
+            "created_at": time.time(),
+        }
+        print(f"[eval] queued Delta LM loss step={step} checkpoint={run_dir}")
+
+    def poll(self, wandb_module=None) -> None:
+        for resp_path in sorted(self.response_dir.glob("*.json")):
+            try:
+                resp = json.loads(resp_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            request_id = resp.get("request_id", resp_path.stem)
+            pending = self.pending.pop(request_id, None)
+            step = int(resp.get("step", pending.get("step", -1) if pending else -1))
+            if resp.get("status") == "ok":
+                metrics = resp["metrics"]
+                log_metrics = {
+                    "eval/ce_clean": metrics["ce_clean"],
+                    "eval/ce_recon": metrics["ce_recon"],
+                    "eval/ce_zero": metrics["ce_zero"],
+                    "eval/delta_lm_loss": metrics["delta_lm_loss"],
+                    "eval/delta_ce": metrics["delta_ce"],
+                    "eval/ce_loss_recovered": metrics["ce_loss_recovered"],
+                    "eval/eval_seconds": metrics.get("eval_seconds", 0.0),
+                }
+                print(
+                    f"[eval] step={step} delta_lm_loss={metrics['delta_lm_loss']:.6f} "
+                    f"ce_recovered={metrics['ce_loss_recovered']:.4f}"
+                )
+                if wandb_module is not None and step >= 0:
+                    wandb_module.log(log_metrics, step=step)
+            else:
+                print(f"[eval] request {request_id} failed: {resp.get('error')}")
+            if pending and not self.eval_keep_checkpoints:
+                shutil.rmtree(pending["run_dir"], ignore_errors=True)
+            try:
+                resp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def drain(self, wandb_module=None) -> None:
+        start = time.time()
+        while self.pending and time.time() - start < self.eval_timeout_sec:
+            self.poll(wandb_module)
+            if self.pending:
+                time.sleep(5)
+        if self.pending:
+            print(f"[eval] timeout with pending requests: {sorted(self.pending)}")
+
+    def close(self) -> None:
+        self.stop_file.write_text("stop\n", encoding="utf-8")
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.terminate()
+        try:
+            self._log_fh.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # training
 # ---------------------------------------------------------------------------
@@ -145,9 +333,24 @@ def train(
     log_every: int = 100,
     ckpt_every: int = 0,
     run_name: str | None = None,
+    output_dir: str | None = None,
+    checkpoint_dir: str | None = None,
+    wandb_project: str = "chem_sae",
+    wandb_entity: str | None = None,
+    wandb_run_name: str | None = None,
     log_to_wandb: bool = True,
     device: str = "cuda",
     seed: int = 42,
+    eval_enabled: bool = False,
+    eval_gpu: int = 7,
+    eval_per_step: int = 500,
+    eval_batch_size: int = 2,
+    eval_n_eval_seqs: int = 32,
+    eval_max_length: int = 128,
+    eval_model: str = "chemdfm",
+    eval_timeout_sec: int = 3600,
+    eval_poll_interval: float = 5.0,
+    eval_keep_checkpoints: bool = False,
 ) -> Dict[str, Any]:
     torch.manual_seed(seed)
     paths.ensure_dirs()
@@ -159,8 +362,11 @@ def train(
     d_in = store.d_model
     d_sae = d_sae or expansion * d_in
     run_name = run_name or f"chemdfm_L{layer:02d}_{arch}_x{d_sae // d_in}_k{k}"
-    out_dir = paths.run_dir(run_name)
+    output_root = Path(output_dir) if output_dir else paths.OUT_DIR
+    out_dir = output_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_root = (Path(checkpoint_dir) / run_name) if checkpoint_dir else out_dir
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
 
     sae, sae_cfg = build_sae(arch, d_in, d_sae, k, device, decoder_init_norm)
     sae.to(device)
@@ -186,17 +392,48 @@ def train(
 
     if log_to_wandb:
         import wandb
-        wandb.init(project="chem_sae", name=run_name, config={
+        wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name or run_name, config={
             "layer": layer, "arch": arch, "d_in": d_in, "d_sae": d_sae,
             "expansion": d_sae // d_in, "k": k, "lr": lr,
             "total_steps": total_steps, "batch_size": batch_size,
             "input_scale": store.input_scale, "n_train_rows": store.n_train_rows,
             "train_block_rows": train_block_rows,
+            "output_dir": str(out_dir),
+            "checkpoint_root": str(checkpoint_root),
+            "training_tokens_total": total_steps * batch_size,
+            "wandb_project": wandb_project,
+            "wandb_entity": wandb_entity,
+            "wandb_run_name": wandb_run_name or run_name,
+            "eval_enabled": eval_enabled,
+            "eval_gpu": eval_gpu,
+            "eval_per_step": eval_per_step,
+            "eval_batch_size": eval_batch_size,
+            "eval_n_eval_seqs": eval_n_eval_seqs,
+            "eval_max_length": eval_max_length,
+            "eval_model": eval_model,
         })
 
     print(f"[train] run={run_name} arch={arch} d_in={d_in} d_sae={d_sae} k={k} "
           f"| train_rows={store.n_train_rows} eval_rows={store.n_eval_rows} "
           f"block_rows={train_block_rows} input_scale={store.input_scale:.4f}")
+
+    eval_mgr = None
+    if eval_enabled:
+        if not log_to_wandb:
+            print("[eval] WARNING: eval_enabled=True but W&B is disabled; metrics will print but not upload")
+        eval_mgr = PeriodicDeltaLmEvaluator(
+            out_dir=out_dir,
+            layer=layer,
+            eval_gpu=eval_gpu,
+            eval_per_step=eval_per_step,
+            eval_batch_size=eval_batch_size,
+            eval_n_eval_seqs=eval_n_eval_seqs,
+            eval_max_length=eval_max_length,
+            eval_model=eval_model,
+            eval_timeout_sec=eval_timeout_sec,
+            eval_poll_interval=eval_poll_interval,
+            eval_keep_checkpoints=eval_keep_checkpoints,
+        )
 
     t0 = time.time()
     last = {}
@@ -236,20 +473,42 @@ def train(
                 "fvu": m["fvu"], "l0": m["l0"],
                 "dead_frac": n_dead / d_sae,
                 "lr": sched.get_last_lr()[0],
+                "tokens_seen": (step + 1) * batch_size,
+                "tokens_total": total_steps * batch_size,
+                "token_progress": (step + 1) / max(total_steps, 1),
+                "train_epoch_equiv": ((step + 1) * batch_size) / max(store.n_train_rows, 1),
                 "tok_per_s": (step + 1) * batch_size / max(time.time() - t0, 1e-6),
             }
             last = rec
             print(f"[train] step={step:>6} loss={rec['loss']:.3f} fvu={rec['fvu']:.4f} "
                   f"l0={rec['l0']:.1f} dead={rec['dead_frac']:.3f} lr={rec['lr']:.2e} "
+                  f"tokens={rec['tokens_seen'] / 1e6:.1f}M/{rec['tokens_total'] / 1e6:.1f}M "
                   f"({rec['tok_per_s']:.0f} tok/s)")
             if log_to_wandb:
                 import wandb
                 wandb.log(rec, step=step)
 
         if ckpt_every and step > 0 and step % ckpt_every == 0:
-            _save(sae, out_dir / f"checkpoint_{step}", store, sae_cfg, layer, arch, k, last, init, asi_meta)
+            _save(sae, checkpoint_root / f"checkpoint_{step}", store, sae_cfg, layer, arch, k, last, init, asi_meta)
+
+        completed_steps = step + 1
+        wandb_module = None
+        if log_to_wandb:
+            import wandb as wandb_module
+        if eval_mgr is not None:
+            eval_mgr.poll(wandb_module)
+            if eval_per_step > 0 and completed_steps % eval_per_step == 0:
+                eval_ckpt = out_dir / "eval_checkpoints" / f"step_{completed_steps:06d}"
+                _save(sae, eval_ckpt, store, sae_cfg, layer, arch, k, last, init, asi_meta)
+                eval_mgr.enqueue(completed_steps, eval_ckpt)
 
     final = _save(sae, out_dir, store, sae_cfg, layer, arch, k, last, init, asi_meta)
+    if eval_mgr is not None:
+        wandb_module = None
+        if log_to_wandb:
+            import wandb as wandb_module
+        eval_mgr.drain(wandb_module)
+        eval_mgr.close()
     print(f"[train] done in {time.time() - t0:.0f}s -> {out_dir}")
     if log_to_wandb:
         import wandb
@@ -274,6 +533,8 @@ def _save(sae, out_dir: Path, store: ActivationStore, sae_cfg, layer, arch, k, l
         "weights_file": str(Path(weights_path).name),
         "cfg_file": str(Path(cfg_path).name),
         "final_metrics": last_metrics,
+        "training_tokens_seen": last_metrics.get("tokens_seen") if isinstance(last_metrics, dict) else None,
+        "training_tokens_total": last_metrics.get("tokens_total") if isinstance(last_metrics, dict) else None,
         "init": init,
         "asi": asi_meta,
         "note": "SAE trained on Stage-3 activations pre-scaled by input_scale; "
@@ -284,33 +545,101 @@ def _save(sae, out_dir: Path, store: ActivationStore, sae_cfg, layer, arch, k, l
     return meta
 
 
+def _load_config(path: str | None) -> Dict[str, Any]:
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    import yaml
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    return {str(k).replace("-", "_"): v for k, v in data.items()}
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Train a Chemistry SAE (SAELens) on ChemDFM activations")
-    ap.add_argument("--layer", type=int, default=paths.MAIN_SAE_LAYER)
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default="configs/train.yaml",
+                     help="YAML config path; CLI flags override values")
+    pre_args, _ = pre.parse_known_args()
+    cfg = _load_config(pre_args.config)
+
+    def c(name: str, default: Any) -> Any:
+        return cfg.get(name, default)
+
+    ap = argparse.ArgumentParser(
+        description="Train a Chemistry SAE (SAELens) on ChemDFM activations",
+        parents=[pre],
+    )
+    ap.add_argument("--layer", type=int, default=c("layer", paths.MAIN_SAE_LAYER))
     ap.add_argument("--arch", choices=["batchtopk", "topk", "jumprelu", "matryoshka"],
-                    default="batchtopk")
-    ap.add_argument("--expansion", type=int, default=16, help="d_sae = expansion * d_in")
-    ap.add_argument("--d-sae", type=int, default=None, help="override d_sae directly")
-    ap.add_argument("--k", type=int, default=32, help="target L0 (avg active latents)")
-    ap.add_argument("--init", choices=["default", "asi"], default="default",
+                    default=c("arch", "batchtopk"))
+    ap.add_argument("--expansion", type=int, default=c("expansion", 16), help="d_sae = expansion * d_in")
+    ap.add_argument("--d-sae", type=int, default=c("d_sae", None), help="override d_sae directly")
+    ap.add_argument("--k", type=int, default=c("k", 32), help="target L0 (avg active latents)")
+    ap.add_argument("--init", choices=["default", "asi"], default=c("init", "default"),
                     help="asi = Active Subspace Init (OpenMOSS dead-feature fix)")
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--total-steps", type=int, default=30_000)
-    ap.add_argument("--batch-size", type=int, default=4096)
-    ap.add_argument("--decoder-init-norm", type=float, default=0.1)
-    ap.add_argument("--dead-window", type=int, default=2_000_000,
+    ap.add_argument("--lr", type=float, default=c("lr", 1e-4))
+    ap.add_argument("--total-steps", type=int, default=c("total_steps", 30_000))
+    ap.add_argument("--batch-size", type=int, default=c("batch_size", 4096))
+    ap.add_argument("--decoder-init-norm", type=float, default=c("decoder_init_norm", 0.1))
+    ap.add_argument("--dead-window", type=int, default=c("dead_window", 2_000_000),
                     help="tokens without firing before a latent is 'dead'")
-    ap.add_argument("--holdout-rows", type=int, default=50_000)
-    ap.add_argument("--train-block-rows", type=int, default=32_768)
-    ap.add_argument("--log-every", type=int, default=100)
-    ap.add_argument("--ckpt-every", type=int, default=0)
-    ap.add_argument("--run-name", type=str, default=None)
-    ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--holdout-rows", type=int, default=c("holdout_rows", 50_000))
+    ap.add_argument("--train-block-rows", type=int, default=c("train_block_rows", 32_768))
+    ap.add_argument("--train-gpu", type=int, default=c("train_gpu", None),
+                    help="physical GPU id for SAE training; sets CUDA_VISIBLE_DEVICES before CUDA init")
+    ap.add_argument("--log-every", type=int, default=c("log_every", 100))
+    ap.add_argument("--ckpt-every", type=int, default=c("ckpt_every", 0),
+                    help="save a persistent checkpoint every N steps; 0 disables")
+    ap.add_argument("--output-dir", default=c("output_dir", str(paths.OUT_DIR)),
+                    help="root directory for final run outputs")
+    ap.add_argument("--checkpoint-dir", default=c("checkpoint_dir", None),
+                    help="root directory for persistent checkpoints; default is output/<run>")
+    ap.add_argument("--log-dir", default=c("log_dir", None),
+                    help="directory for tee logs written by train_sae.py; null disables internal tee logging")
+    ap.add_argument("--log-file", default=c("log_file", None),
+                    help="optional explicit log file name/path; relative paths live under log_dir")
+    ap.add_argument("--run-name", type=str, default=c("run_name", None))
+    ap.add_argument("--wandb-project", default=c("wandb_project", "chem_sae"))
+    ap.add_argument("--wandb-entity", default=c("wandb_entity", None))
+    ap.add_argument("--wandb-run-name", default=c("wandb_run_name", None))
+    ap.add_argument("--wandb", dest="no_wandb", action="store_false",
+                    help="enable W&B logging even if config sets wandb: false")
+    ap.add_argument("--no-wandb", dest="no_wandb", action="store_true",
+                    default=not bool(c("wandb", True)),
+                    help="disable W&B logging even if config sets wandb: true")
+    ap.add_argument("--eval", dest="eval_enabled", action="store_true", default=bool(c("eval", False)),
+                    help="enable periodic Delta LM loss eval on a second GPU")
+    ap.add_argument("--no-eval", dest="eval_enabled", action="store_false",
+                    help="disable periodic Delta LM loss eval")
+    ap.add_argument("--eval-gpu", type=int, default=c("eval_gpu", 7),
+                    help="physical GPU id for the persistent LM eval worker")
+    ap.add_argument("--eval-per-step", type=int, default=c("eval_per_step", 500),
+                    help="run Delta LM loss every N completed training steps")
+    ap.add_argument("--eval-batch-size", type=int, default=c("eval_batch_size", 2),
+                    help="text batch size for Delta LM loss eval worker")
+    ap.add_argument("--eval-n-eval-seqs", type=int, default=c("eval_n_eval_seqs", 32),
+                    help="number of fixed holdout texts used by Delta LM loss")
+    ap.add_argument("--eval-max-length", type=int, default=c("eval_max_length", 128),
+                    help="max token length for Delta LM loss text batches")
+    ap.add_argument("--eval-model", default=c("eval_model", "chemdfm"),
+                    help="model_config registry name for Delta LM loss")
+    ap.add_argument("--eval-timeout-sec", type=int, default=c("eval_timeout_sec", 3600),
+                    help="max seconds to wait for pending eval jobs at training end")
+    ap.add_argument("--eval-poll-interval", type=float, default=c("eval_poll_interval", 5.0),
+                    help="seconds between eval worker filesystem polls")
+    ap.add_argument("--eval-keep-checkpoints", action="store_true", default=bool(c("eval_keep_checkpoints", False)),
+                    help="keep intermediate eval checkpoints instead of deleting after eval result")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny end-to-end run for validation")
     args = ap.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    setup_file_logging(args.log_dir, args.log_file, args.run_name)
+
+    if args.train_gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.train_gpu)
+        print(f"[train] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} (train_gpu)")
 
     if args.smoke:
         args.expansion = 8
@@ -322,6 +651,7 @@ def main() -> None:
         args.train_block_rows = 1024
         args.log_every = 20
         args.no_wandb = True
+        args.eval_enabled = False
 
     train(
         layer=args.layer,
@@ -340,7 +670,22 @@ def main() -> None:
         log_every=args.log_every,
         ckpt_every=args.ckpt_every,
         run_name=args.run_name,
+        output_dir=args.output_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
         log_to_wandb=not args.no_wandb,
+        eval_enabled=args.eval_enabled,
+        eval_gpu=args.eval_gpu,
+        eval_per_step=args.eval_per_step,
+        eval_batch_size=args.eval_batch_size,
+        eval_n_eval_seqs=args.eval_n_eval_seqs,
+        eval_max_length=args.eval_max_length,
+        eval_model=args.eval_model,
+        eval_timeout_sec=args.eval_timeout_sec,
+        eval_poll_interval=args.eval_poll_interval,
+        eval_keep_checkpoints=args.eval_keep_checkpoints,
     )
 
 
