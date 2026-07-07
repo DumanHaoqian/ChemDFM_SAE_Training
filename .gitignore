@@ -1,0 +1,12 @@
+output/
+__pycache__/
+*.pyc
+wandb/
+
+__pycache__/
+*.pyc
+._*
+.DS_Store
+output/
+wandb/
+*.log

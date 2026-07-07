@@ -1,0 +1,10 @@
+# Stage 4 SAE training reference config (CLI flags override).
+# Main line: BatchTopK on the residual stream (§2.2). Empirical starting points
+# from the design (§2.2), to be sweept later against downstream detection AUC.
+arch: batchtopk        # batchtopk | topk | jumprelu | matryoshka
+layer: 26              # main SAE layer (Stage 1 selection)
+expansion: 16          # d_sae = 16 * 5120 = 81920 latents
+k: 32                  # target L0 (avg active latents); try 32-64
+lr: 1.0e-4
+total_steps: 30000
+batch_s
