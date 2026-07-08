@@ -225,3 +225,4 @@ wandb:  View run at https://wandb.ai/23098841d-the-hong-kong-polytechnic-univers
 [train] step=  8800 loss=493.118 fvu=0.0002 l0=32.0 dead=0.511 lr=1.00e-04 tokens=27.0M/122.9M (1152 tok/s)
 [train] step=  8850 loss=447.951 fvu=0.0001 l0=32.0 dead=0.508 lr=1.00e-04 tokens=27.2M/122.9M (1151 tok/s)
 [train] step=  8900 loss=457.053 fvu=0.0002 l0=32.0 dead=0.507 lr=1.00e-04 tokens=27.3M/122.9M (1150 tok/s)
+[train] step=  8950 loss=454.045 fvu=0.0001 l0=32.0 dead=0.509 lr=1.00e-04 tokens=27.5M/122.9M (1149 tok/s)
