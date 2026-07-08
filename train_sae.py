@@ -87,7 +87,8 @@ from init_asi import asi_init_sae
 # SAE construction
 # ---------------------------------------------------------------------------
 def build_sae(arch: str, d_in: int, d_sae: int, k: int, device: str,
-              decoder_init_norm: float, matryoshka_widths=None):
+              decoder_init_norm: float, jumprelu_l0_coefficient: float = 2.0,
+              jumprelu_l0_warm_up_steps: int = 1000, matryoshka_widths=None):
     from sae_lens import (
         BatchTopKTrainingSAE, BatchTopKTrainingSAEConfig,
         TopKTrainingSAE, TopKTrainingSAEConfig,
@@ -106,7 +107,10 @@ def build_sae(arch: str, d_in: int, d_sae: int, k: int, device: str,
         cfg = TopKTrainingSAEConfig(k=int(k), rescale_acts_by_decoder_norm=True, **common)
         return TopKTrainingSAE(cfg), cfg
     if arch == "jumprelu":
-        cfg = JumpReLUTrainingSAEConfig(l0_coefficient=2.0, l0_warm_up_steps=1000, **common)
+        cfg = JumpReLUTrainingSAEConfig(
+            l0_coefficient=float(jumprelu_l0_coefficient),
+            l0_warm_up_steps=int(jumprelu_l0_warm_up_steps),
+            **common)
         return JumpReLUTrainingSAE(cfg), cfg
     if arch == "matryoshka":
         widths = matryoshka_widths or _default_matryoshka_widths(d_sae)
@@ -320,6 +324,8 @@ def train(
     expansion: int = 16,
     d_sae: int | None = None,
     k: int = 32,
+    jumprelu_l0_coefficient: float = 2.0,
+    jumprelu_l0_warm_up_steps: int = 1000,
     init: str = "default",
     lr: float = 1e-4,
     total_steps: int = 30_000,
@@ -368,7 +374,11 @@ def train(
     checkpoint_root = (Path(checkpoint_dir) / run_name) if checkpoint_dir else out_dir
     checkpoint_root.mkdir(parents=True, exist_ok=True)
 
-    sae, sae_cfg = build_sae(arch, d_in, d_sae, k, device, decoder_init_norm)
+    sae, sae_cfg = build_sae(
+        arch, d_in, d_sae, k, device, decoder_init_norm,
+        jumprelu_l0_coefficient=jumprelu_l0_coefficient,
+        jumprelu_l0_warm_up_steps=jumprelu_l0_warm_up_steps,
+    )
     sae.to(device)
     coeff_cfg = sae.get_coefficients()
 
@@ -394,7 +404,10 @@ def train(
         import wandb
         wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name or run_name, config={
             "layer": layer, "arch": arch, "d_in": d_in, "d_sae": d_sae,
-            "expansion": d_sae // d_in, "k": k, "lr": lr,
+            "expansion": d_sae // d_in, "k": k,
+            "jumprelu_l0_coefficient": jumprelu_l0_coefficient,
+            "jumprelu_l0_warm_up_steps": jumprelu_l0_warm_up_steps,
+            "lr": lr,
             "total_steps": total_steps, "batch_size": batch_size,
             "input_scale": store.input_scale, "n_train_rows": store.n_train_rows,
             "train_block_rows": train_block_rows,
@@ -576,6 +589,12 @@ def main() -> None:
     ap.add_argument("--expansion", type=int, default=c("expansion", 16), help="d_sae = expansion * d_in")
     ap.add_argument("--d-sae", type=int, default=c("d_sae", None), help="override d_sae directly")
     ap.add_argument("--k", type=int, default=c("k", 32), help="target L0 (avg active latents)")
+    ap.add_argument("--jumprelu-l0-coefficient", type=float,
+                    default=c("jumprelu_l0_coefficient", 2.0),
+                    help="JumpReLU L0 sparsity penalty coefficient; higher is sparser")
+    ap.add_argument("--jumprelu-l0-warm-up-steps", type=int,
+                    default=c("jumprelu_l0_warm_up_steps", 1000),
+                    help="steps used to warm up the JumpReLU L0 penalty")
     ap.add_argument("--init", choices=["default", "asi"], default=c("init", "default"),
                     help="asi = Active Subspace Init (OpenMOSS dead-feature fix)")
     ap.add_argument("--lr", type=float, default=c("lr", 1e-4))
@@ -659,6 +678,8 @@ def main() -> None:
         expansion=args.expansion,
         d_sae=args.d_sae,
         k=args.k,
+        jumprelu_l0_coefficient=args.jumprelu_l0_coefficient,
+        jumprelu_l0_warm_up_steps=args.jumprelu_l0_warm_up_steps,
         init=args.init,
         lr=args.lr,
         total_steps=args.total_steps,

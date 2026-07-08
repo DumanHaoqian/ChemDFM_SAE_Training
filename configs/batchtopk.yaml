@@ -1,7 +1,3 @@
-# Backward-compatible default config. Prefer architecture-specific configs:
-#   --config configs/batchtopk.yaml
-#   --config configs/jumprelu.yaml
-# This file mirrors configs/batchtopk.yaml.
 # Stage 4 SAE training config: BatchTopK mainline. CLI flags override these values.
 
 # ----- training placement -----

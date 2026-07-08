@@ -1,8 +1,6 @@
-# Backward-compatible default config. Prefer architecture-specific configs:
-#   --config configs/batchtopk.yaml
-#   --config configs/jumprelu.yaml
-# This file mirrors configs/batchtopk.yaml.
-# Stage 4 SAE training config: BatchTopK mainline. CLI flags override these values.
+# Stage 4 SAE training config: JumpReLU baseline. CLI flags override these values.
+# JumpReLU is NOT TopK: k does not enforce L0. Sparsity is controlled by the
+# JumpReLU L0 penalty / threshold dynamics, so compare L0 explicitly in W&B.
 
 # ----- training placement -----
 train_gpu: 6            # Physical GPU id used for SAE training; train_sae.py sets CUDA_VISIBLE_DEVICES to this id.
@@ -20,11 +18,11 @@ wandb_project: chem_sae
 wandb_entity: null
 wandb_run_name: null
 
-# ----- BatchTopK SAE architecture / optimization -----
-arch: batchtopk         # Batch-level TopK SAE; k directly fixes average active latents.
+# ----- JumpReLU SAE architecture / optimization -----
+arch: jumprelu          # JumpReLU baseline; dense unless L0 penalty is strong enough.
 layer: 26
-expansion: 16           # d_sae = expansion * d_in; ChemDFM d_in=5120 so 16x gives 81920 latents.
-k: 32                   # Target L0 / active latents per token for BatchTopK.
+expansion: 16
+k: 32                   # Kept only for shared CLI/run metadata; does NOT enforce JumpReLU L0.
 init: asi
 lr: 1.0e-4
 total_steps: 30000
@@ -35,6 +33,11 @@ dead_window: 2000000
 holdout_rows: 50000
 log_every: 50
 run_name: null
+
+# JumpReLU-specific sparsity knobs. Higher l0_coefficient forces lower L0,
+# usually at the cost of reconstruction fidelity / Delta LM loss.
+jumprelu_l0_coefficient: 100.0
+jumprelu_l0_warm_up_steps: 1000
 
 # ----- periodic Delta LM loss eval -----
 eval: true

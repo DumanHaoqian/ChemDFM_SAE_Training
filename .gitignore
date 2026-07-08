@@ -2,6 +2,7 @@ output/
 __pycache__/
 *.pyc
 wandb/
+checkpoints/
 
 __pycache__/
 *.pyc
