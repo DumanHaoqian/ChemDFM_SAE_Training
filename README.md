@@ -49,6 +49,14 @@ python train_sae.py --smoke --layer 26 --no-wandb
 Output (`output/<run_name>/`): `sae_weights.safetensors` + `cfg.json`
 (JumpReLU inference model, load with `sae_lens.SAE.load_from_disk`) and
 `training_meta.json` (layer, arch, k, d_sae, **`input_scale`**, final metrics).
+The local Sparsemax Attention SAE writes `sparsemax_attention_sae.safetensors`
+when `safetensors` is installed, and keeps backward-compatible `.pt` loading for
+older runs.
+
+By default, `train_sae.py` refuses to overwrite an existing run directory that
+already has `training_meta.json`; pass `--overwrite` only for intentional reruns.
+Logs live under `logs/`, while `output/`, `checkpoints/`, `wandb/`, `logs/`,
+`.nfs*`, and platform sidecars are ignored by Git.
 
 > The SAE is trained on activations pre-scaled by `input_scale`. To encode
 > **raw** ChemDFM activations downstream, multiply by `input_scale` first
@@ -70,6 +78,13 @@ activation-frequency histogram, and **Delta LM loss** (`ce_clean` vs `ce_recon`
 vs `ce_zero`, `delta_lm_loss`, and fraction of CE loss recovered). Written to
 `output/<run>/eval.json`.
 
+Delta LM loss now requires a fixed held-out JSONL at
+`/home/haoqian/Data/Graph/SAERAG_Stage3/data/corpus/sae_eval_corpus.jsonl`
+unless `--eval-texts-path` / `eval_texts_path` is provided. The eval report logs
+the file path, number of texts, policy, and SHA256 digest of the selected text
+slice. This avoids treating the first rows of the training corpus as a formal
+holdout metric.
+
 ### Metric: Delta LM loss
 
 Delta LM loss is the primary SAE fidelity metric: splice the SAE into the LM
@@ -88,6 +103,11 @@ because it evaluates behavioural fidelity, not just numerical closeness.
 Use `--wandb` during eval to log `eval/delta_lm_loss`, `eval/ce_clean`,
 `eval/ce_recon`, `eval/ce_zero`, and `eval/ce_loss_recovered`.
 
+The persistent periodic eval worker writes `READY.json`, `HEARTBEAT`, and
+`FATAL.json` under `output/<run>/delta_lm_eval/`. Training fails fast if the
+worker cannot load, exits unexpectedly, or a request exceeds
+`eval_request_timeout_sec`.
+
 The *ultimate* selection metric is downstream RAGLens detection AUC (a later
 stage), not MSE; this stage produces the Pareto inputs (L0 vs FVU / Delta LM loss).
 
@@ -102,6 +122,17 @@ python run_layer_sweep.py --layers 12 18 24 26 30 --arch batchtopk --no-wandb
 Suggested comparisons: `--arch matryoshka` (feature absorption/splitting),
 `--arch jumprelu` (Gemma-Scope-style baseline), and an off-the-shelf Qwen2.5 SAE
 ablation to demonstrate the domain SAE is necessary.
+
+## Paths
+
+Default A6000 paths can be overridden without editing code:
+
+```bash
+export SAERAG_GRAPH_DIR=/home/haoqian/Data/Graph
+export SAERAG_STAGE3_DIR=/home/haoqian/Data/Graph/SAERAG_Stage3
+export SAERAG_STAGE4_DIR=/home/haoqian/Data/Graph/SAERAG_Stage4
+export CHEMDFM_MODEL_PATH=/home/haoqian/Data/Graph/ChemDFM-v2.0-14B
+```
 
 ## Validation performed
 

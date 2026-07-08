@@ -62,5 +62,9 @@ eval_n_eval_seqs: 32
 eval_max_length: 128
 eval_model: chemdfm
 eval_timeout_sec: 3600
+eval_startup_timeout_sec: 600
+eval_request_timeout_sec: 1800
 eval_poll_interval: 5.0
 eval_keep_checkpoints: false
+eval_texts_path: null
+overwrite: false

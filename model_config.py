@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Dict
 import torch
 
+import paths
+
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
@@ -37,7 +39,7 @@ def register(cfg: ModelConfig) -> ModelConfig:
 
 register(ModelConfig(
     name="chemdfm",
-    model_path="/home/haoqian/Data/Graph/ChemDFM-v2.0-14B",
+    model_path=paths.MODEL_PATH,
     d_model=5120, n_layers=48, default_sae_layer=26,
     layer_module_fmt="model.layers.{layer}", dtype="bfloat16"))
 

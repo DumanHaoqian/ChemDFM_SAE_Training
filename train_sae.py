@@ -82,6 +82,7 @@ def setup_file_logging(log_dir: str | None, log_file: str | None, run_name: str 
 import paths
 from data import ActivationStore
 from init_asi import asi_init_sae
+from metrics import reconstruction_fvu
 
 
 # ---------------------------------------------------------------------------
@@ -200,10 +201,7 @@ def resolve_coefficients(coeff_cfg: Dict[str, Any], step: int) -> Dict[str, floa
 @torch.no_grad()
 def batch_metrics(sae_in: torch.Tensor, sae_out: torch.Tensor,
                   feature_acts: torch.Tensor) -> Dict[str, float]:
-    resid = sae_out - sae_in
-    num = resid.pow(2).sum()
-    den = (sae_in - sae_in.mean(0, keepdim=True)).pow(2).sum().clamp_min(1e-8)
-    fvu = (num / den).item()
+    fvu = reconstruction_fvu(sae_in, sae_out)
     l0 = (feature_acts > 0).float().sum(-1).mean().item()
     return {"fvu": fvu, "l0": l0}
 
@@ -227,19 +225,27 @@ class PeriodicDeltaLmEvaluator:
         eval_max_length: int,
         eval_model: str,
         eval_timeout_sec: int,
+        eval_startup_timeout_sec: int,
+        eval_request_timeout_sec: int,
         eval_poll_interval: float,
         eval_keep_checkpoints: bool,
+        eval_texts_path: str | None,
     ):
         self.out_dir = Path(out_dir)
         self.layer = int(layer)
         self.eval_gpu = int(eval_gpu)
         self.eval_per_step = int(eval_per_step)
         self.eval_timeout_sec = int(eval_timeout_sec)
+        self.eval_startup_timeout_sec = int(eval_startup_timeout_sec)
+        self.eval_request_timeout_sec = int(eval_request_timeout_sec)
         self.eval_keep_checkpoints = bool(eval_keep_checkpoints)
         self.root = self.out_dir / "delta_lm_eval"
         self.request_dir = self.root / "requests"
         self.response_dir = self.root / "responses"
         self.stop_file = self.root / "STOP"
+        self.ready_file = self.root / "READY.json"
+        self.heartbeat_file = self.root / "HEARTBEAT"
+        self.fatal_file = self.root / "FATAL.json"
         self.log_path = self.root / "eval_worker.log"
         self.pending: Dict[str, Dict[str, Any]] = {}
         self.best_delta_lm_loss = float("inf")
@@ -253,8 +259,8 @@ class PeriodicDeltaLmEvaluator:
         for d in (self.request_dir, self.response_dir):
             for stale in list(d.glob("*.json")) + list(d.glob("*.tmp")):
                 stale.unlink(missing_ok=True)
-        if self.stop_file.exists():
-            self.stop_file.unlink()
+        for stale in (self.stop_file, self.ready_file, self.heartbeat_file, self.fatal_file):
+            stale.unlink(missing_ok=True)
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.eval_gpu)
@@ -264,12 +270,17 @@ class PeriodicDeltaLmEvaluator:
             "--request-dir", str(self.request_dir),
             "--response-dir", str(self.response_dir),
             "--stop-file", str(self.stop_file),
+            "--ready-file", str(self.ready_file),
+            "--heartbeat-file", str(self.heartbeat_file),
+            "--fatal-file", str(self.fatal_file),
             "--model", eval_model,
             "--n-eval-seqs", str(eval_n_eval_seqs),
             "--max-length", str(eval_max_length),
             "--batch-size", str(eval_batch_size),
             "--poll-interval", str(eval_poll_interval),
         ]
+        if eval_texts_path:
+            cmd.extend(["--eval-texts-path", str(eval_texts_path)])
         self._log_fh = self.log_path.open("a", encoding="utf-8")
         self.proc = subprocess.Popen(
             cmd,
@@ -280,8 +291,69 @@ class PeriodicDeltaLmEvaluator:
             text=True,
         )
         print(f"[eval] worker pid={self.proc.pid} gpu={self.eval_gpu} log={self.log_path}")
+        try:
+            self._wait_until_ready()
+        except Exception:
+            self.close()
+            raise
+
+    def _read_json(self, path: Path) -> Dict[str, Any]:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _worker_tail(self, n_chars: int = 4000) -> str:
+        try:
+            return self.log_path.read_text(encoding="utf-8", errors="replace")[-n_chars:]
+        except FileNotFoundError:
+            return ""
+
+    def _raise_fatal_if_present(self) -> None:
+        if self.fatal_file.exists():
+            try:
+                fatal = self._read_json(self.fatal_file)
+                detail = fatal.get("error") or fatal
+            except Exception:
+                detail = self.fatal_file.read_text(encoding="utf-8", errors="replace")
+            raise RuntimeError(f"Delta LM eval worker fatal error: {detail}\n{self._worker_tail()}")
+
+    def _check_worker_alive(self) -> None:
+        self._raise_fatal_if_present()
+        if self.proc is not None and self.proc.poll() is not None and not self.stop_file.exists():
+            raise RuntimeError(
+                f"Delta LM eval worker exited with code {self.proc.returncode}; log={self.log_path}\n"
+                f"{self._worker_tail()}"
+            )
+
+    def _wait_until_ready(self) -> None:
+        start = time.time()
+        while time.time() - start < self.eval_startup_timeout_sec:
+            self._check_worker_alive()
+            if self.ready_file.exists():
+                ready = self._read_json(self.ready_file)
+                print(
+                    f"[eval] worker ready texts={ready.get('n_eval_texts')} "
+                    f"sha256={str(ready.get('eval_texts_sha256', ''))[:12]}"
+                )
+                return
+            time.sleep(1)
+        raise TimeoutError(
+            f"Delta LM eval worker was not ready after {self.eval_startup_timeout_sec}s; "
+            f"log={self.log_path}\n{self._worker_tail()}"
+        )
+
+    def _check_request_timeouts(self) -> None:
+        now = time.time()
+        expired = [
+            request_id for request_id, payload in self.pending.items()
+            if now - float(payload["created_at"]) > self.eval_request_timeout_sec
+        ]
+        if expired:
+            raise TimeoutError(
+                f"Delta LM eval request timeout after {self.eval_request_timeout_sec}s: {expired}; "
+                f"log={self.log_path}\n{self._worker_tail()}"
+            )
 
     def enqueue(self, step: int, run_dir: Path) -> None:
+        self._check_worker_alive()
         request_id = f"step_{int(step):06d}"
         payload = {
             "request_id": request_id,
@@ -302,6 +374,8 @@ class PeriodicDeltaLmEvaluator:
         print(f"[eval] queued Delta LM loss step={step} checkpoint={run_dir}")
 
     def poll(self, wandb_module=None) -> None:
+        self._check_worker_alive()
+        self._check_request_timeouts()
         for resp_path in sorted(self.response_dir.glob("*.json")):
             try:
                 resp = json.loads(resp_path.read_text(encoding="utf-8"))
@@ -351,7 +425,7 @@ class PeriodicDeltaLmEvaluator:
                 if wandb_module is not None and step >= 0:
                     wandb_module.log(log_metrics)
             else:
-                print(f"[eval] request {request_id} failed: {resp.get('error')}")
+                raise RuntimeError(f"[eval] request {request_id} failed: {resp.get('error')}")
             if pending and not self.eval_keep_checkpoints:
                 shutil.rmtree(pending["run_dir"], ignore_errors=True)
             try:
@@ -366,7 +440,10 @@ class PeriodicDeltaLmEvaluator:
             if self.pending:
                 time.sleep(5)
         if self.pending:
-            print(f"[eval] timeout with pending requests: {sorted(self.pending)}")
+            raise TimeoutError(
+                f"[eval] timeout with pending requests after {self.eval_timeout_sec}s: "
+                f"{sorted(self.pending)}"
+            )
 
     def close(self) -> None:
         self.stop_file.write_text("stop\n", encoding="utf-8")
@@ -375,6 +452,11 @@ class PeriodicDeltaLmEvaluator:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=10)
         try:
             self._log_fh.close()
         except Exception:
@@ -438,8 +520,12 @@ def train(
     eval_max_length: int = 128,
     eval_model: str = "chemdfm",
     eval_timeout_sec: int = 3600,
+    eval_startup_timeout_sec: int = 600,
+    eval_request_timeout_sec: int = 1800,
     eval_poll_interval: float = 5.0,
     eval_keep_checkpoints: bool = False,
+    eval_texts_path: str | None = None,
+    overwrite: bool = False,
 ) -> Dict[str, Any]:
     torch.manual_seed(seed)
     paths.ensure_dirs()
@@ -453,6 +539,11 @@ def train(
     run_name = run_name or f"chemdfm_L{layer:02d}_{arch}_x{d_sae // d_in}_k{k}"
     output_root = Path(output_dir) if output_dir else paths.OUT_DIR
     out_dir = output_root / run_name
+    if out_dir.exists() and (out_dir / "training_meta.json").exists() and not overwrite:
+        raise FileExistsError(
+            f"Refusing to overwrite existing run directory {out_dir}. "
+            "Pass --overwrite for an intentional rerun with the same name."
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_root = (Path(checkpoint_dir) / run_name) if checkpoint_dir else out_dir
     checkpoint_root.mkdir(parents=True, exist_ok=True)
@@ -506,6 +597,7 @@ def train(
     # dead-feature tracking (in tokens since last activation)
     tokens_since_fired = torch.zeros(d_sae, device=device)
 
+    wandb_started = False
     if log_to_wandb:
         import wandb
         wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name or run_name, config={
@@ -547,7 +639,12 @@ def train(
             "eval_n_eval_seqs": eval_n_eval_seqs,
             "eval_max_length": eval_max_length,
             "eval_model": eval_model,
+            "eval_texts_path": eval_texts_path or str(paths.EVAL_TEXTS_PATH),
+            "eval_startup_timeout_sec": eval_startup_timeout_sec,
+            "eval_request_timeout_sec": eval_request_timeout_sec,
+            "overwrite": overwrite,
         })
+        wandb_started = True
         wandb.define_metric("eval_step")
         wandb.define_metric("eval/*", step_metric="eval_step")
 
@@ -556,114 +653,120 @@ def train(
           f"block_rows={train_block_rows} input_scale={store.input_scale:.4f}")
 
     eval_mgr = None
-    if eval_enabled:
-        if not log_to_wandb:
-            print("[eval] WARNING: eval_enabled=True but W&B is disabled; metrics will print but not upload")
-        eval_mgr = PeriodicDeltaLmEvaluator(
-            out_dir=out_dir,
-            layer=layer,
-            eval_gpu=eval_gpu,
-            eval_per_step=eval_per_step,
-            eval_batch_size=eval_batch_size,
-            eval_n_eval_seqs=eval_n_eval_seqs,
-            eval_max_length=eval_max_length,
-            eval_model=eval_model,
-            eval_timeout_sec=eval_timeout_sec,
-            eval_poll_interval=eval_poll_interval,
-            eval_keep_checkpoints=eval_keep_checkpoints,
-        )
-
     t0 = time.time()
     last = {}
-    for step in range(total_steps):
-        sae_in = store.next_train_batch(batch_size)
-        dead_mask = tokens_since_fired > dead_feature_window
+    try:
+        if eval_enabled:
+            if not log_to_wandb:
+                print("[eval] WARNING: eval_enabled=True but W&B is disabled; metrics will print but not upload")
+            eval_mgr = PeriodicDeltaLmEvaluator(
+                out_dir=out_dir,
+                layer=layer,
+                eval_gpu=eval_gpu,
+                eval_per_step=eval_per_step,
+                eval_batch_size=eval_batch_size,
+                eval_n_eval_seqs=eval_n_eval_seqs,
+                eval_max_length=eval_max_length,
+                eval_model=eval_model,
+                eval_timeout_sec=eval_timeout_sec,
+                eval_startup_timeout_sec=eval_startup_timeout_sec,
+                eval_request_timeout_sec=eval_request_timeout_sec,
+                eval_poll_interval=eval_poll_interval,
+                eval_keep_checkpoints=eval_keep_checkpoints,
+                eval_texts_path=eval_texts_path,
+            )
 
-        from sae_lens.saes.sae import TrainStepInput
-        step_input = TrainStepInput(
-            sae_in=sae_in,
-            coefficients=resolve_coefficients(coeff_cfg, step),
-            dead_neuron_mask=dead_mask,
-            n_training_steps=step,
-            is_logging_step=(step % log_every == 0),
-        )
-        out = sae.training_forward_pass(step_input)
-        loss = out.loss
+        for step in range(total_steps):
+            sae_in = store.next_train_batch(batch_size)
+            dead_mask = tokens_since_fired > dead_feature_window
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
-        opt.step()
-        sched.step()
+            from sae_lens.saes.sae import TrainStepInput
+            step_input = TrainStepInput(
+                sae_in=sae_in,
+                coefficients=resolve_coefficients(coeff_cfg, step),
+                dead_neuron_mask=dead_mask,
+                n_training_steps=step,
+                is_logging_step=(step % log_every == 0),
+            )
+            out = sae.training_forward_pass(step_input)
+            loss = out.loss
 
-        # update dead-feature counters
-        with torch.no_grad():
-            fired = (out.feature_acts > 0).any(0)
-            tokens_since_fired[fired] = 0
-            tokens_since_fired[~fired] += sae_in.shape[0]
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+            opt.step()
+            sched.step()
 
-        if step % log_every == 0 or step == total_steps - 1:
-            m = batch_metrics(out.sae_in, out.sae_out, out.feature_acts)
-            n_dead = int((tokens_since_fired > dead_feature_window).sum().item())
-            rec = {
-                "loss": float(loss.item()),
-                "mse": float(out.losses["mse_loss"].item()),
-                "fvu": m["fvu"], "l0": m["l0"],
-                "dead_frac": n_dead / d_sae,
-                "lr": sched.get_last_lr()[0],
-                "tokens_seen": (step + 1) * batch_size,
-                "tokens_total": total_steps * batch_size,
-                "token_progress": (step + 1) / max(total_steps, 1),
-                "train_epoch_equiv": ((step + 1) * batch_size) / max(store.n_train_rows, 1),
-                "tok_per_s": (step + 1) * batch_size / max(time.time() - t0, 1e-6),
-            }
-            for loss_name, loss_value in out.losses.items():
-                if loss_name == "loss":
-                    continue
-                if hasattr(loss_value, "detach"):
-                    rec[f"loss/{loss_name}"] = float(loss_value.detach().float().item())
-            last = rec
-            aux = ""
-            if "loss/l0_proxy" in rec:
-                aux += f" l0p={rec['loss/l0_proxy']:.1f}"
-            if "loss/cosine_raw" in rec:
-                aux += f" cos={rec['loss/cosine_raw']:.3f}"
-            if "loss/norm_rel_error" in rec:
-                aux += f" normerr={rec['loss/norm_rel_error']:.3f}"
-            print(f"[train] step={step:>6} loss={rec['loss']:.3f} fvu={rec['fvu']:.4f} "
-                  f"l0={rec['l0']:.1f}{aux} dead={rec['dead_frac']:.3f} lr={rec['lr']:.2e} "
-                  f"tokens={rec['tokens_seen'] / 1e6:.1f}M/{rec['tokens_total'] / 1e6:.1f}M "
-                  f"({rec['tok_per_s']:.0f} tok/s)")
+            # update dead-feature counters
+            with torch.no_grad():
+                fired = (out.feature_acts > 0).any(0)
+                tokens_since_fired[fired] = 0
+                tokens_since_fired[~fired] += sae_in.shape[0]
+
+            if step % log_every == 0 or step == total_steps - 1:
+                m = batch_metrics(out.sae_in, out.sae_out, out.feature_acts)
+                n_dead = int((tokens_since_fired > dead_feature_window).sum().item())
+                rec = {
+                    "loss": float(loss.item()),
+                    "mse": float(out.losses["mse_loss"].item()),
+                    "fvu": m["fvu"], "l0": m["l0"],
+                    "dead_frac": n_dead / d_sae,
+                    "lr": sched.get_last_lr()[0],
+                    "tokens_seen": (step + 1) * batch_size,
+                    "tokens_total": total_steps * batch_size,
+                    "token_progress": (step + 1) / max(total_steps, 1),
+                    "train_epoch_equiv": ((step + 1) * batch_size) / max(store.n_train_rows, 1),
+                    "tok_per_s": (step + 1) * batch_size / max(time.time() - t0, 1e-6),
+                }
+                for loss_name, loss_value in out.losses.items():
+                    if loss_name == "loss":
+                        continue
+                    if hasattr(loss_value, "detach"):
+                        rec[f"loss/{loss_name}"] = float(loss_value.detach().float().item())
+                last = rec
+                aux = ""
+                if "loss/l0_proxy" in rec:
+                    aux += f" l0p={rec['loss/l0_proxy']:.1f}"
+                if "loss/cosine_raw" in rec:
+                    aux += f" cos={rec['loss/cosine_raw']:.3f}"
+                if "loss/norm_rel_error" in rec:
+                    aux += f" normerr={rec['loss/norm_rel_error']:.3f}"
+                print(f"[train] step={step:>6} loss={rec['loss']:.3f} fvu={rec['fvu']:.4f} "
+                      f"l0={rec['l0']:.1f}{aux} dead={rec['dead_frac']:.3f} lr={rec['lr']:.2e} "
+                      f"tokens={rec['tokens_seen'] / 1e6:.1f}M/{rec['tokens_total'] / 1e6:.1f}M "
+                      f"({rec['tok_per_s']:.0f} tok/s)")
+                if log_to_wandb:
+                    import wandb
+                    wandb.log(rec, step=step)
+
+            if ckpt_every and step > 0 and step % ckpt_every == 0:
+                _save(sae, checkpoint_root / f"checkpoint_{step}", store, sae_cfg, layer, arch, k, last, init, asi_meta)
+
+            completed_steps = step + 1
+            wandb_module = None
             if log_to_wandb:
-                import wandb
-                wandb.log(rec, step=step)
+                import wandb as wandb_module
+            if eval_mgr is not None:
+                eval_mgr.poll(wandb_module)
+                if eval_per_step > 0 and completed_steps % eval_per_step == 0:
+                    eval_ckpt = out_dir / "eval_checkpoints" / f"step_{completed_steps:06d}"
+                    _save(sae, eval_ckpt, store, sae_cfg, layer, arch, k, last, init, asi_meta)
+                    eval_mgr.enqueue(completed_steps, eval_ckpt)
 
-        if ckpt_every and step > 0 and step % ckpt_every == 0:
-            _save(sae, checkpoint_root / f"checkpoint_{step}", store, sae_cfg, layer, arch, k, last, init, asi_meta)
-
-        completed_steps = step + 1
-        wandb_module = None
-        if log_to_wandb:
-            import wandb as wandb_module
+        final = _save(sae, out_dir, store, sae_cfg, layer, arch, k, last, init, asi_meta)
         if eval_mgr is not None:
-            eval_mgr.poll(wandb_module)
-            if eval_per_step > 0 and completed_steps % eval_per_step == 0:
-                eval_ckpt = out_dir / "eval_checkpoints" / f"step_{completed_steps:06d}"
-                _save(sae, eval_ckpt, store, sae_cfg, layer, arch, k, last, init, asi_meta)
-                eval_mgr.enqueue(completed_steps, eval_ckpt)
-
-    final = _save(sae, out_dir, store, sae_cfg, layer, arch, k, last, init, asi_meta)
-    if eval_mgr is not None:
-        wandb_module = None
-        if log_to_wandb:
-            import wandb as wandb_module
-        eval_mgr.drain(wandb_module)
-        eval_mgr.close()
-    print(f"[train] done in {time.time() - t0:.0f}s -> {out_dir}")
-    if log_to_wandb:
-        import wandb
-        wandb.finish()
-    return final
+            wandb_module = None
+            if log_to_wandb:
+                import wandb as wandb_module
+            eval_mgr.drain(wandb_module)
+        print(f"[train] done in {time.time() - t0:.0f}s -> {out_dir}")
+        return final
+    finally:
+        if eval_mgr is not None:
+            eval_mgr.close()
+        if log_to_wandb and wandb_started:
+            import wandb
+            wandb.finish()
 
 
 def _save(sae, out_dir: Path, store: ActivationStore, sae_cfg, layer, arch, k, last_metrics,
@@ -826,10 +929,18 @@ def main() -> None:
                     help="model_config registry name for Delta LM loss")
     ap.add_argument("--eval-timeout-sec", type=int, default=c("eval_timeout_sec", 3600),
                     help="max seconds to wait for pending eval jobs at training end")
+    ap.add_argument("--eval-startup-timeout-sec", type=int, default=c("eval_startup_timeout_sec", 600),
+                    help="max seconds to wait for the persistent eval worker to become ready")
+    ap.add_argument("--eval-request-timeout-sec", type=int, default=c("eval_request_timeout_sec", 1800),
+                    help="max seconds to wait for one Delta LM eval request")
     ap.add_argument("--eval-poll-interval", type=float, default=c("eval_poll_interval", 5.0),
                     help="seconds between eval worker filesystem polls")
     ap.add_argument("--eval-keep-checkpoints", action="store_true", default=bool(c("eval_keep_checkpoints", False)),
                     help="keep intermediate eval checkpoints instead of deleting after eval result")
+    ap.add_argument("--eval-texts-path", default=c("eval_texts_path", None),
+                    help="fixed JSONL holdout for Delta LM eval; defaults to paths.EVAL_TEXTS_PATH")
+    ap.add_argument("--overwrite", action="store_true", default=bool(c("overwrite", False)),
+                    help="allow writing into an existing run directory with training_meta.json")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny end-to-end run for validation")
     args = ap.parse_args()
@@ -918,8 +1029,12 @@ def main() -> None:
         eval_max_length=args.eval_max_length,
         eval_model=args.eval_model,
         eval_timeout_sec=args.eval_timeout_sec,
+        eval_startup_timeout_sec=args.eval_startup_timeout_sec,
+        eval_request_timeout_sec=args.eval_request_timeout_sec,
         eval_poll_interval=args.eval_poll_interval,
         eval_keep_checkpoints=args.eval_keep_checkpoints,
+        eval_texts_path=args.eval_texts_path,
+        overwrite=args.overwrite,
     )
 
 

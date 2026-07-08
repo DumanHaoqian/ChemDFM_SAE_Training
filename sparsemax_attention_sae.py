@@ -232,10 +232,17 @@ class SparsemaxAttentionSAE(nn.Module):
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         weights_path = out / "sparsemax_attention_sae.pt"
+        safe_weights_path = out / "sparsemax_attention_sae.safetensors"
         cfg_path = out / "cfg.json"
         torch.save({"state_dict": self.state_dict(), "cfg": asdict(self.cfg)}, weights_path)
+        try:
+            from safetensors.torch import save_file
+
+            save_file(self.state_dict(), safe_weights_path)
+        except ImportError:
+            pass
         cfg_path.write_text(json.dumps(asdict(self.cfg), indent=2), encoding="utf-8")
-        return str(weights_path), str(cfg_path)
+        return str(safe_weights_path if safe_weights_path.exists() else weights_path), str(cfg_path)
 
     @classmethod
     def load_from_disk(cls, run_dir: str | Path, device: str = "cuda"):
@@ -244,8 +251,15 @@ class SparsemaxAttentionSAE(nn.Module):
         cfg_dict["device"] = device
         cfg = SparsemaxAttentionSAEConfig(**cfg_dict)
         model = cls(cfg)
-        ckpt = torch.load(run_dir / "sparsemax_attention_sae.pt", map_location=device)
-        model.load_state_dict(ckpt["state_dict"], strict=True)
+        safe_weights_path = run_dir / "sparsemax_attention_sae.safetensors"
+        if safe_weights_path.exists():
+            from safetensors.torch import load_file
+
+            state_dict = load_file(safe_weights_path, device=device)
+        else:
+            ckpt = torch.load(run_dir / "sparsemax_attention_sae.pt", map_location=device)
+            state_dict = ckpt["state_dict"]
+        model.load_state_dict(state_dict, strict=True)
         model.to(device)
         model.eval()
         return model

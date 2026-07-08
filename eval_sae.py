@@ -26,13 +26,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import numpy as np
 import torch
 
 import paths
 from data import ActivationStore
+from delta_lm import delta_lm_loss_with_loaded_lm, load_eval_texts
+from metrics import FVUAccumulator
 
 
 def load_sae(run_dir: Path, device: str):
@@ -81,8 +83,7 @@ def recon_eval(
         seed=42,
     )
 
-    num = torch.zeros((), device=device)
-    den = torch.zeros((), device=device)
+    fvu_acc = FVUAccumulator(device=device)
     l0_sum = torch.zeros((), device=device)
     n_rows = 0
     fired_count = torch.zeros(d_sae, device=device)
@@ -90,13 +91,12 @@ def recon_eval(
     for x in store.eval_batches(batch_size, max_batches=max_batches):
         feats = sae.encode(x)
         recon = sae.decode(feats)
-        num += (recon - x).pow(2).sum()
-        den += (x - x.mean(0, keepdim=True)).pow(2).sum()
+        fvu_acc.update(x, recon)
         l0_sum += (feats > 0).float().sum()
         fired_count += (feats > 0).float().sum(0)
         n_rows += x.shape[0]
 
-    fvu = (num / den.clamp_min(1e-8)).item()
+    fvu = fvu_acc.fvu()
     l0 = (l0_sum / max(n_rows, 1)).item()
     freq = (fired_count / max(n_rows, 1)).cpu().numpy()
     dead_frac = float((freq == 0).mean())
@@ -135,6 +135,7 @@ def delta_lm_loss_eval(
     max_length: int = 128,
     batch_size: int = 1,
     model: str = "chemdfm",
+    eval_texts_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Measure LM CE increase caused by replacing layer activations with SAE recon.
 
@@ -150,92 +151,20 @@ def delta_lm_loss_eval(
     from model_config import HFHookedModel, get_model_config
 
     hk = HFHookedModel(get_model_config(model), device=device)
-    target = hk.layer_module(layer)
     sae = load_sae(run_dir, device)
-
-    corpus_path = paths.STAGE3_DIR / "data" / "corpus" / "sae_corpus.jsonl"
-    texts: List[str] = []
-    with corpus_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            texts.append(item["text"])
-            if len(texts) >= n_eval_seqs:
-                break
-    if not texts:
-        raise ValueError(f"No eval texts found in {corpus_path}")
-
-    def ce_for(mode: str) -> float:
-        total_loss, total_tok = 0.0, 0
-        handle = None
-
-        def hook(_module, _inputs, output):
-            hs = output[0] if isinstance(output, tuple) else output
-            if mode == "zero":
-                new = torch.zeros_like(hs)
-            elif mode == "recon":
-                x_scaled = hs.to(torch.float32) * input_scale
-                recon_scaled = sae.decode(sae.encode(x_scaled))
-                new = (recon_scaled / input_scale).to(hs.dtype)
-            else:
-                raise ValueError(f"Unexpected hook mode: {mode}")
-            if isinstance(output, tuple):
-                return (new,) + tuple(output[1:])
-            return new
-
-        if mode != "clean":
-            handle = target.register_forward_hook(hook)
-        try:
-            for start in range(0, len(texts), batch_size):
-                batch = texts[start:start + batch_size]
-                enc = hk.tokenizer(
-                    batch,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=max_length,
-                ).to(device)
-                logits = hk.model(**enc).logits
-                ids = enc["input_ids"]
-                attn = enc["attention_mask"]
-                shift_labels = ids[:, 1:]
-                shift_mask = attn[:, 1:].bool()
-                loss = torch.nn.functional.cross_entropy(
-                    logits[:, :-1, :].reshape(-1, logits.size(-1)).float(),
-                    shift_labels.reshape(-1),
-                    reduction="none",
-                )
-                loss = loss[shift_mask.reshape(-1)]
-                total_loss += float(loss.sum().item())
-                total_tok += int(shift_mask.sum().item())
-                del logits, loss, enc
-        finally:
-            if handle is not None:
-                handle.remove()
-        return total_loss / max(total_tok, 1)
-
-    ce_clean = ce_for("clean")
-    ce_recon = ce_for("recon")
-    ce_zero = ce_for("zero")
-    delta = ce_recon - ce_clean
-    zero_delta = ce_zero - ce_clean
-    recovered = 1.0 - delta / max(zero_delta, 1e-8)
-
-    return {
-        "layer": layer,
-        "hook_point": "resid_post",
-        "hook_module": hk.cfg.layer_module_fmt.format(layer=layer),
-        "n_eval_seqs": len(texts),
-        "max_length": max_length,
-        "batch_size": batch_size,
-        "ce_clean": ce_clean,
-        "ce_recon": ce_recon,
-        "ce_zero": ce_zero,
-        "delta_lm_loss": delta,
-        "delta_ce": delta,
-        "ce_loss_recovered": recovered,
-    }
+    texts, text_meta = load_eval_texts(eval_texts_path, n_eval_seqs)
+    metrics = delta_lm_loss_with_loaded_lm(
+        sae=sae,
+        input_scale=input_scale,
+        layer=layer,
+        hk=hk,
+        texts=texts,
+        max_length=max_length,
+        batch_size=batch_size,
+        device=device,
+    )
+    metrics.update(text_meta)
+    return metrics
 
 
 def delta_ce_eval(*args, **kwargs) -> Dict[str, Any]:
@@ -265,6 +194,7 @@ def maybe_log_wandb(
             "n_eval_seqs": args.n_eval_seqs,
             "max_length": args.max_length,
             "delta_batch_size": args.delta_batch_size,
+            "eval_texts_path": args.eval_texts_path or str(paths.EVAL_TEXTS_PATH),
         },
     )
     metrics = {
@@ -303,6 +233,8 @@ def main() -> None:
     ap.add_argument("--max-length", type=int, default=128)
     ap.add_argument("--delta-batch-size", type=int, default=1,
                     help="text batch size for Delta LM loss eval")
+    ap.add_argument("--eval-texts-path", default=None,
+                    help="fixed JSONL holdout for Delta LM loss; defaults to paths.EVAL_TEXTS_PATH")
     ap.add_argument("--model", default="chemdfm", help="model_config registry name")
     ap.add_argument("--wandb", action="store_true", help="log eval metrics to W&B")
     ap.add_argument("--wandb-project", default="chem_sae")
@@ -334,6 +266,7 @@ def main() -> None:
             max_length=args.max_length,
             batch_size=args.delta_batch_size,
             model=args.model,
+            eval_texts_path=args.eval_texts_path,
         )
         print(
             "[delta-lm-loss] "

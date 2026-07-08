@@ -14,124 +14,26 @@ import json
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import torch
 
-import paths
+from delta_lm import delta_lm_loss_with_loaded_lm, load_eval_texts
 from eval_sae import load_sae, load_training_meta
 from model_config import HFHookedModel, get_model_config
 
 
-def load_eval_texts(n_eval_seqs: int) -> List[str]:
-    corpus_path = paths.STAGE3_DIR / "data" / "corpus" / "sae_corpus.jsonl"
-    texts: List[str] = []
-    with corpus_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            texts.append(item["text"])
-            if len(texts) >= n_eval_seqs:
-                break
-    if not texts:
-        raise ValueError(f"No eval texts found in {corpus_path}")
-    return texts
-
-
-@torch.no_grad()
-def delta_lm_loss_with_loaded_lm(
-    run_dir: Path,
-    layer: int,
-    hk: HFHookedModel,
-    texts: List[str],
-    max_length: int,
-    batch_size: int,
-    device: str = "cuda",
-) -> Dict[str, Any]:
-    meta = load_training_meta(run_dir)
-    input_scale = float(meta.get("input_scale", 1.0))
-    sae = load_sae(run_dir, device)
-    target = hk.layer_module(layer)
-
-    def ce_for(mode: str) -> float:
-        total_loss, total_tok = 0.0, 0
-        handle = None
-
-        def hook(_module, _inputs, output):
-            hs = output[0] if isinstance(output, tuple) else output
-            if mode == "zero":
-                new = torch.zeros_like(hs)
-            elif mode == "recon":
-                x_scaled = hs.to(torch.float32) * input_scale
-                recon_scaled = sae.decode(sae.encode(x_scaled))
-                new = (recon_scaled / input_scale).to(hs.dtype)
-            else:
-                raise ValueError(f"Unexpected hook mode: {mode}")
-            if isinstance(output, tuple):
-                return (new,) + tuple(output[1:])
-            return new
-
-        if mode != "clean":
-            handle = target.register_forward_hook(hook)
-        try:
-            for start in range(0, len(texts), batch_size):
-                batch = texts[start:start + batch_size]
-                enc = hk.tokenizer(
-                    batch,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=max_length,
-                ).to(device)
-                logits = hk.model(**enc).logits
-                ids = enc["input_ids"]
-                attn = enc["attention_mask"]
-                shift_labels = ids[:, 1:]
-                shift_mask = attn[:, 1:].bool()
-                loss = torch.nn.functional.cross_entropy(
-                    logits[:, :-1, :].reshape(-1, logits.size(-1)).float(),
-                    shift_labels.reshape(-1),
-                    reduction="none",
-                )
-                loss = loss[shift_mask.reshape(-1)]
-                total_loss += float(loss.sum().item())
-                total_tok += int(shift_mask.sum().item())
-                del logits, loss, enc
-        finally:
-            if handle is not None:
-                handle.remove()
-        return total_loss / max(total_tok, 1)
-
-    ce_clean = ce_for("clean")
-    ce_recon = ce_for("recon")
-    ce_zero = ce_for("zero")
-    delta = ce_recon - ce_clean
-    zero_delta = ce_zero - ce_clean
-    recovered = 1.0 - delta / max(zero_delta, 1e-8)
-
-    del sae
-    torch.cuda.empty_cache()
-
-    return {
-        "layer": layer,
-        "hook_point": "resid_post",
-        "hook_module": hk.cfg.layer_module_fmt.format(layer=layer),
-        "n_eval_seqs": len(texts),
-        "max_length": max_length,
-        "batch_size": batch_size,
-        "ce_clean": ce_clean,
-        "ce_recon": ce_recon,
-        "ce_zero": ce_zero,
-        "delta_lm_loss": delta,
-        "delta_ce": delta,
-        "ce_loss_recovered": recovered,
-    }
-
-
 def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def write_text_atomic(path: Path, payload: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(payload, encoding="utf-8")
     tmp.replace(path)
 
 
@@ -140,6 +42,10 @@ def main() -> None:
     ap.add_argument("--request-dir", required=True)
     ap.add_argument("--response-dir", required=True)
     ap.add_argument("--stop-file", required=True)
+    ap.add_argument("--ready-file", required=True)
+    ap.add_argument("--heartbeat-file", required=True)
+    ap.add_argument("--fatal-file", required=True)
+    ap.add_argument("--eval-texts-path", default=None)
     ap.add_argument("--model", default="chemdfm")
     ap.add_argument("--n-eval-seqs", type=int, default=32)
     ap.add_argument("--max-length", type=int, default=128)
@@ -150,20 +56,49 @@ def main() -> None:
     request_dir = Path(args.request_dir)
     response_dir = Path(args.response_dir)
     stop_file = Path(args.stop_file)
+    ready_file = Path(args.ready_file)
+    heartbeat_file = Path(args.heartbeat_file)
+    fatal_file = Path(args.fatal_file)
     request_dir.mkdir(parents=True, exist_ok=True)
     response_dir.mkdir(parents=True, exist_ok=True)
 
-    print(
-        f"[eval-worker] loading LM model={args.model} n_eval_seqs={args.n_eval_seqs} "
-        f"max_length={args.max_length} batch_size={args.batch_size}",
-        flush=True,
-    )
-    hk = HFHookedModel(get_model_config(args.model), device="cuda")
-    texts = load_eval_texts(args.n_eval_seqs)
-    print("[eval-worker] ready", flush=True)
+    def heartbeat() -> None:
+        write_text_atomic(heartbeat_file, f"{time.time():.6f}\n")
+
+    try:
+        print(
+            f"[eval-worker] loading LM model={args.model} n_eval_seqs={args.n_eval_seqs} "
+            f"max_length={args.max_length} batch_size={args.batch_size}",
+            flush=True,
+        )
+        hk = HFHookedModel(get_model_config(args.model), device="cuda")
+        texts, text_meta = load_eval_texts(args.eval_texts_path, args.n_eval_seqs)
+        ready_payload = {
+            "status": "ready",
+            "ready_at": time.time(),
+            "model": args.model,
+            "max_length": args.max_length,
+            "batch_size": args.batch_size,
+            **text_meta,
+        }
+        write_json_atomic(ready_file, ready_payload)
+        heartbeat()
+        print("[eval-worker] ready", flush=True)
+    except Exception as exc:
+        fatal_payload = {
+            "status": "fatal",
+            "failed_at": time.time(),
+            "error": repr(exc),
+            "traceback": traceback.format_exc(),
+        }
+        write_json_atomic(fatal_file, fatal_payload)
+        print("[eval-worker] FATAL", fatal_payload["error"], flush=True)
+        print(fatal_payload["traceback"], flush=True)
+        raise
 
     seen: set[str] = set()
     while True:
+        heartbeat()
         if stop_file.exists() and not list(request_dir.glob("*.json")):
             print("[eval-worker] stop requested; no pending requests", flush=True)
             break
@@ -185,8 +120,12 @@ def main() -> None:
                 layer = int(req["layer"])
                 print(f"[eval-worker] step={step} loading SAE {run_dir}", flush=True)
                 t0 = time.time()
+                meta = load_training_meta(run_dir)
+                input_scale = float(meta.get("input_scale", 1.0))
+                sae = load_sae(run_dir, device="cuda")
                 metrics = delta_lm_loss_with_loaded_lm(
-                    run_dir=run_dir,
+                    sae=sae,
+                    input_scale=input_scale,
                     layer=layer,
                     hk=hk,
                     texts=texts,
@@ -194,7 +133,10 @@ def main() -> None:
                     batch_size=args.batch_size,
                     device="cuda",
                 )
+                metrics.update(text_meta)
                 metrics["eval_seconds"] = time.time() - t0
+                del sae
+                torch.cuda.empty_cache()
                 response = {
                     "request_id": request_id,
                     "status": "ok",

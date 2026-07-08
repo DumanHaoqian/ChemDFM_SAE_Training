@@ -34,6 +34,8 @@ def main() -> None:
     ap.add_argument("--total-steps", type=int, default=30_000)
     ap.add_argument("--batch-size", type=int, default=4096)
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="allow overwriting existing per-layer run directories")
     args = ap.parse_args()
 
     paths.ensure_dirs()
@@ -49,6 +51,7 @@ def main() -> None:
             layer=layer, arch=args.arch, expansion=args.expansion, k=args.k,
             lr=args.lr, total_steps=args.total_steps, batch_size=args.batch_size,
             log_to_wandb=not args.no_wandb, run_name=run_name,
+            overwrite=args.overwrite,
         )
         run_dir = paths.run_dir(run_name)
         recon = recon_eval(run_dir, layer, batch_size=args.batch_size)
