@@ -1,0 +1,49 @@
+# Stage 4 SAE training config: Matryoshka-BatchTopK.
+# This run keeps the same layer / width / total token budget as BatchTopK and
+# JumpReLU, but uses nested dictionary prefixes so smaller prefix dictionaries
+# are also trained to reconstruct the activation.
+
+# ----- training placement -----
+train_gpu: 0            # Physical GPU id used for SAE training.
+
+# ----- output / logging / checkpoints -----
+output_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/output
+log_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/logs
+log_file: null
+checkpoint_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/checkpoints
+ckpt_every: 1000
+
+# ----- W&B -----
+wandb: true
+wandb_project: chem_sae
+wandb_entity: null
+wandb_run_name: null
+
+# ----- Matryoshka-BatchTopK SAE architecture / optimization -----
+arch: matryoshka        # Matryoshka BatchTopK with auxiliary losses on nested prefixes.
+layer: 26
+expansion: 16           # d_sae = expansion * d_in; ChemDFM d_in=5120 so 16x gives 81920 latents.
+k: 32                   # BatchTopK target L0 for each training batch.
+matryoshka_widths: [5120, 10240, 40960, 81920]  # 1x, 2x, 8x, 16x nested prefix dictionaries.
+init: asi
+lr: 1.0e-4
+total_steps: 40000      # 40000 * 3072 = 122.88M tokens, aligned with 30000 * 4096.
+batch_size: 3072        # Lower than BatchTopK to fit GPU0 while another process occupies ~14GB.
+train_block_rows: 32768 # Contiguous block sampling to avoid NAS random-read bottlenecks.
+decoder_init_norm: 0.1
+dead_window: 2000000
+holdout_rows: 50000
+log_every: 50
+run_name: null
+
+# ----- periodic Delta LM loss eval -----
+eval: true
+eval_gpu: 3             # Physical GPU id for persistent ChemDFM Delta LM loss worker.
+eval_per_step: 500      # Run Delta LM loss every 500 optimizer steps.
+eval_batch_size: 2
+eval_n_eval_seqs: 32
+eval_max_length: 128
+eval_model: chemdfm
+eval_timeout_sec: 3600
+eval_poll_interval: 5.0
+eval_keep_checkpoints: false

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """train_sae.py — train a Sparse Autoencoder on ChemDFM residual-stream activations.
 
-Uses SAELens' SAE implementations (BatchTopK is the main line, §2.2) inside a
+Uses SAELens' SAE implementations plus local SAELens-compatible modules (BatchTopK is the main line, §2.2) inside a
 custom training loop that reads the Stage-3 disk cache. This keeps full control
 over the 14B HF model / chemistry tokenizer / layer sweep without forcing
 ChemDFM through TransformerLens.
@@ -12,6 +12,7 @@ Architectures (``--arch``):
   * ``topk``       — per-sample TopK.
   * ``jumprelu``   — JumpReLU (Gemma-Scope style baseline).
   * ``matryoshka`` — Matryoshka-BatchTopK with nested prefixes.
+  * ``sparsemax_attention`` -- sparsemax attention over a learned SAE dictionary.
 
 Key knobs match the design guidance: expansion 8x-32x, k (L0) ~= 32-64,
 lr ~1e-4 with warmup, unit-normalised decoder, dead-feature revival via the
@@ -88,7 +89,21 @@ from init_asi import asi_init_sae
 # ---------------------------------------------------------------------------
 def build_sae(arch: str, d_in: int, d_sae: int, k: int, device: str,
               decoder_init_norm: float, jumprelu_l0_coefficient: float = 2.0,
-              jumprelu_l0_warm_up_steps: int = 1000, matryoshka_widths=None):
+              jumprelu_l0_warm_up_steps: int = 1000, matryoshka_widths=None,
+              sparsemax_key_dim: int | None = None,
+              sparsemax_preselect_k: int | None = 2048,
+              sparsemax_activation_mode: str = "probs",
+              sparsemax_use_input_norm: bool = True,
+              sparsemax_use_idf_mask: bool = False,
+              sparsemax_idf_threshold: float = 0.1,
+              sparsemax_mse_loss_scale: float = 1.0,
+              sparsemax_score_scale: float = 2.0,
+              sparsemax_l0_target: float | None = 32.0,
+              sparsemax_l0_coefficient: float = 10.0,
+              sparsemax_cosine_loss_coefficient: float = 0.0,
+              sparsemax_norm_loss_coefficient: float = 0.0,
+              sparsemax_value_scale_init: float = 1.0,
+              sparsemax_global_output_scale_init: float = 1.0):
     from sae_lens import (
         BatchTopKTrainingSAE, BatchTopKTrainingSAEConfig,
         TopKTrainingSAE, TopKTrainingSAEConfig,
@@ -118,6 +133,31 @@ def build_sae(arch: str, d_in: int, d_sae: int, k: int, device: str,
             k=float(k), rescale_acts_by_decoder_norm=True,
             matryoshka_widths=widths, use_matryoshka_aux_loss=True, **common)
         return MatryoshkaBatchTopKTrainingSAE(cfg), cfg
+    if arch == "sparsemax_attention":
+        from sparsemax_attention_sae import SparsemaxAttentionSAE, SparsemaxAttentionSAEConfig
+
+        cfg = SparsemaxAttentionSAEConfig(
+            d_in=d_in,
+            d_sae=d_sae,
+            dtype="float32",
+            device=device,
+            decoder_init_norm=decoder_init_norm,
+            key_dim=sparsemax_key_dim,
+            preselect_k=sparsemax_preselect_k,
+            activation_mode=sparsemax_activation_mode,
+            use_input_norm=sparsemax_use_input_norm,
+            use_idf_mask=sparsemax_use_idf_mask,
+            idf_threshold=sparsemax_idf_threshold,
+            mse_loss_scale=sparsemax_mse_loss_scale,
+            score_scale=sparsemax_score_scale,
+            l0_target=sparsemax_l0_target,
+            l0_coefficient=sparsemax_l0_coefficient,
+            cosine_loss_coefficient=sparsemax_cosine_loss_coefficient,
+            norm_loss_coefficient=sparsemax_norm_loss_coefficient,
+            value_scale_init=sparsemax_value_scale_init,
+            global_output_scale_init=sparsemax_global_output_scale_init,
+        )
+        return SparsemaxAttentionSAE(cfg), cfg
     raise ValueError(f"unknown arch: {arch}")
 
 
@@ -202,6 +242,9 @@ class PeriodicDeltaLmEvaluator:
         self.stop_file = self.root / "STOP"
         self.log_path = self.root / "eval_worker.log"
         self.pending: Dict[str, Dict[str, Any]] = {}
+        self.best_delta_lm_loss = float("inf")
+        self.best_dir = self.out_dir / "best_delta_lm_loss"
+        self.best_meta_path = self.out_dir / "best_delta_lm_loss.json"
         self.proc: subprocess.Popen | None = None
 
         self.root.mkdir(parents=True, exist_ok=True)
@@ -270,6 +313,7 @@ class PeriodicDeltaLmEvaluator:
             if resp.get("status") == "ok":
                 metrics = resp["metrics"]
                 log_metrics = {
+                    "eval_step": step,
                     "eval/ce_clean": metrics["ce_clean"],
                     "eval/ce_recon": metrics["ce_recon"],
                     "eval/ce_zero": metrics["ce_zero"],
@@ -278,12 +322,34 @@ class PeriodicDeltaLmEvaluator:
                     "eval/ce_loss_recovered": metrics["ce_loss_recovered"],
                     "eval/eval_seconds": metrics.get("eval_seconds", 0.0),
                 }
+                delta = float(metrics["delta_lm_loss"])
+                is_best = delta < self.best_delta_lm_loss
+                log_metrics["eval/is_best_delta_lm_loss"] = int(is_best)
+                if is_best:
+                    self.best_delta_lm_loss = delta
+                    source_dir = Path(resp.get("run_dir") or (pending or {}).get("run_dir", ""))
+                    if source_dir.exists():
+                        if self.best_dir.exists():
+                            shutil.rmtree(self.best_dir, ignore_errors=True)
+                        shutil.copytree(source_dir, self.best_dir)
+                    best_payload = {
+                        "step": step,
+                        "source_checkpoint": str(source_dir),
+                        "best_dir": str(self.best_dir),
+                        "metrics": metrics,
+                        "saved_at": time.time(),
+                    }
+                    self.best_meta_path.write_text(json.dumps(best_payload, indent=2), encoding="utf-8")
+                    if self.best_dir.exists():
+                        (self.best_dir / "best_delta_lm_loss.json").write_text(
+                            json.dumps(best_payload, indent=2), encoding="utf-8")
+                    print(f"[eval] new best Delta LM loss step={step} delta={delta:.6f} -> {self.best_dir}")
                 print(
                     f"[eval] step={step} delta_lm_loss={metrics['delta_lm_loss']:.6f} "
                     f"ce_recovered={metrics['ce_loss_recovered']:.4f}"
                 )
                 if wandb_module is not None and step >= 0:
-                    wandb_module.log(log_metrics, step=step)
+                    wandb_module.log(log_metrics)
             else:
                 print(f"[eval] request {request_id} failed: {resp.get('error')}")
             if pending and not self.eval_keep_checkpoints:
@@ -326,6 +392,23 @@ def train(
     k: int = 32,
     jumprelu_l0_coefficient: float = 2.0,
     jumprelu_l0_warm_up_steps: int = 1000,
+    matryoshka_widths: list[int] | None = None,
+    sparsemax_key_dim: int | None = None,
+    sparsemax_preselect_k: int | None = 2048,
+    sparsemax_activation_mode: str = "probs",
+    sparsemax_use_input_norm: bool = True,
+    sparsemax_use_idf_mask: bool = False,
+    sparsemax_idf_threshold: float = 0.1,
+    sparsemax_mse_loss_scale: float = 1.0,
+    sparsemax_score_scale: float = 2.0,
+    sparsemax_l0_target: float | None = 32.0,
+    sparsemax_l0_coefficient: float = 10.0,
+    sparsemax_cosine_loss_coefficient: float = 0.0,
+    sparsemax_norm_loss_coefficient: float = 0.0,
+    sparsemax_value_scale_init: float = 1.0,
+    sparsemax_global_output_scale_init: float = 1.0,
+    sparsemax_init_b_dec_from_data: bool = False,
+    sparsemax_b_dec_init_rows: int = 10_000,
     init: str = "default",
     lr: float = 1e-4,
     total_steps: int = 30_000,
@@ -378,6 +461,21 @@ def train(
         arch, d_in, d_sae, k, device, decoder_init_norm,
         jumprelu_l0_coefficient=jumprelu_l0_coefficient,
         jumprelu_l0_warm_up_steps=jumprelu_l0_warm_up_steps,
+        matryoshka_widths=matryoshka_widths,
+        sparsemax_key_dim=sparsemax_key_dim,
+        sparsemax_preselect_k=sparsemax_preselect_k,
+        sparsemax_activation_mode=sparsemax_activation_mode,
+        sparsemax_use_input_norm=sparsemax_use_input_norm,
+        sparsemax_use_idf_mask=sparsemax_use_idf_mask,
+        sparsemax_idf_threshold=sparsemax_idf_threshold,
+        sparsemax_mse_loss_scale=sparsemax_mse_loss_scale,
+        sparsemax_score_scale=sparsemax_score_scale,
+        sparsemax_l0_target=sparsemax_l0_target,
+        sparsemax_l0_coefficient=sparsemax_l0_coefficient,
+        sparsemax_cosine_loss_coefficient=sparsemax_cosine_loss_coefficient,
+        sparsemax_norm_loss_coefficient=sparsemax_norm_loss_coefficient,
+        sparsemax_value_scale_init=sparsemax_value_scale_init,
+        sparsemax_global_output_scale_init=sparsemax_global_output_scale_init,
     )
     sae.to(device)
     coeff_cfg = sae.get_coefficients()
@@ -390,6 +488,14 @@ def train(
         print(f"[train] ASI init: active_rank={asi_meta['active_rank']}/{d_in} "
               f"frac={asi_meta['active_rank_frac']} on {n_fit} rows")
         del x_fit
+
+    if arch == "sparsemax_attention" and sparsemax_init_b_dec_from_data:
+        n_bias = min(int(sparsemax_b_dec_init_rows), store.n_train_rows)
+        x_bias = store.sample_train_blocks(n_bias, block_rows=1024)
+        bias_meta = sae.set_decoder_bias_from_data(x_bias)
+        print(f"[train] Sparsemax b_dec init: rows={bias_meta['b_dec_init_rows']} "
+              f"norm={bias_meta['b_dec_init_norm']:.4f}")
+        del x_bias
 
     warmup_steps = warmup_steps if warmup_steps is not None else max(1, total_steps // 20)
     decay_steps = int(total_steps * decay_frac)
@@ -407,6 +513,23 @@ def train(
             "expansion": d_sae // d_in, "k": k,
             "jumprelu_l0_coefficient": jumprelu_l0_coefficient,
             "jumprelu_l0_warm_up_steps": jumprelu_l0_warm_up_steps,
+            "matryoshka_widths": matryoshka_widths,
+            "sparsemax_key_dim": sparsemax_key_dim,
+            "sparsemax_preselect_k": sparsemax_preselect_k,
+            "sparsemax_activation_mode": sparsemax_activation_mode,
+            "sparsemax_use_input_norm": sparsemax_use_input_norm,
+            "sparsemax_use_idf_mask": sparsemax_use_idf_mask,
+            "sparsemax_idf_threshold": sparsemax_idf_threshold,
+            "sparsemax_mse_loss_scale": sparsemax_mse_loss_scale,
+            "sparsemax_score_scale": sparsemax_score_scale,
+            "sparsemax_l0_target": sparsemax_l0_target,
+            "sparsemax_l0_coefficient": sparsemax_l0_coefficient,
+            "sparsemax_cosine_loss_coefficient": sparsemax_cosine_loss_coefficient,
+            "sparsemax_norm_loss_coefficient": sparsemax_norm_loss_coefficient,
+            "sparsemax_value_scale_init": sparsemax_value_scale_init,
+            "sparsemax_global_output_scale_init": sparsemax_global_output_scale_init,
+            "sparsemax_init_b_dec_from_data": sparsemax_init_b_dec_from_data,
+            "sparsemax_b_dec_init_rows": sparsemax_b_dec_init_rows,
             "lr": lr,
             "total_steps": total_steps, "batch_size": batch_size,
             "input_scale": store.input_scale, "n_train_rows": store.n_train_rows,
@@ -425,6 +548,8 @@ def train(
             "eval_max_length": eval_max_length,
             "eval_model": eval_model,
         })
+        wandb.define_metric("eval_step")
+        wandb.define_metric("eval/*", step_metric="eval_step")
 
     print(f"[train] run={run_name} arch={arch} d_in={d_in} d_sae={d_sae} k={k} "
           f"| train_rows={store.n_train_rows} eval_rows={store.n_eval_rows} "
@@ -492,9 +617,21 @@ def train(
                 "train_epoch_equiv": ((step + 1) * batch_size) / max(store.n_train_rows, 1),
                 "tok_per_s": (step + 1) * batch_size / max(time.time() - t0, 1e-6),
             }
+            for loss_name, loss_value in out.losses.items():
+                if loss_name == "loss":
+                    continue
+                if hasattr(loss_value, "detach"):
+                    rec[f"loss/{loss_name}"] = float(loss_value.detach().float().item())
             last = rec
+            aux = ""
+            if "loss/l0_proxy" in rec:
+                aux += f" l0p={rec['loss/l0_proxy']:.1f}"
+            if "loss/cosine_raw" in rec:
+                aux += f" cos={rec['loss/cosine_raw']:.3f}"
+            if "loss/norm_rel_error" in rec:
+                aux += f" normerr={rec['loss/norm_rel_error']:.3f}"
             print(f"[train] step={step:>6} loss={rec['loss']:.3f} fvu={rec['fvu']:.4f} "
-                  f"l0={rec['l0']:.1f} dead={rec['dead_frac']:.3f} lr={rec['lr']:.2e} "
+                  f"l0={rec['l0']:.1f}{aux} dead={rec['dead_frac']:.3f} lr={rec['lr']:.2e} "
                   f"tokens={rec['tokens_seen'] / 1e6:.1f}M/{rec['tokens_total'] / 1e6:.1f}M "
                   f"({rec['tok_per_s']:.0f} tok/s)")
             if log_to_wandb:
@@ -584,7 +721,7 @@ def main() -> None:
         parents=[pre],
     )
     ap.add_argument("--layer", type=int, default=c("layer", paths.MAIN_SAE_LAYER))
-    ap.add_argument("--arch", choices=["batchtopk", "topk", "jumprelu", "matryoshka"],
+    ap.add_argument("--arch", choices=["batchtopk", "topk", "jumprelu", "matryoshka", "sparsemax_attention"],
                     default=c("arch", "batchtopk"))
     ap.add_argument("--expansion", type=int, default=c("expansion", 16), help="d_sae = expansion * d_in")
     ap.add_argument("--d-sae", type=int, default=c("d_sae", None), help="override d_sae directly")
@@ -595,6 +732,50 @@ def main() -> None:
     ap.add_argument("--jumprelu-l0-warm-up-steps", type=int,
                     default=c("jumprelu_l0_warm_up_steps", 1000),
                     help="steps used to warm up the JumpReLU L0 penalty")
+    ap.add_argument("--matryoshka-widths", default=c("matryoshka_widths", None),
+                    help="comma-separated nested prefix widths for Matryoshka SAE; default is d_sae/16,d_sae/8,d_sae/2,d_sae")
+    ap.add_argument("--sparsemax-key-dim", type=int, default=c("sparsemax_key_dim", None),
+                    help="attention key/query dimension for Sparsemax Attention SAE; null uses min(1024, d_in)")
+    ap.add_argument("--sparsemax-preselect-k", type=int, default=c("sparsemax_preselect_k", 2048),
+                    help="top score candidates before sparsemax; <=0 means full dictionary sparsemax")
+    ap.add_argument("--sparsemax-activation-mode", choices=["probs", "masked_scores"],
+                    default=c("sparsemax_activation_mode", "probs"),
+                    help="Sparsemax activations: sparse probabilities or sparse masked logits")
+    ap.add_argument("--sparsemax-use-input-norm", dest="sparsemax_use_input_norm", action="store_true",
+                    default=bool(c("sparsemax_use_input_norm", True)),
+                    help="encode activation direction and multiply sparse coefficients by input norm")
+    ap.add_argument("--sparsemax-no-input-norm", dest="sparsemax_use_input_norm", action="store_false",
+                    help="disable input-norm factorization for Sparsemax Attention SAE")
+    ap.add_argument("--sparsemax-use-idf-mask", dest="sparsemax_use_idf_mask", action="store_true",
+                    default=bool(c("sparsemax_use_idf_mask", False)),
+                    help="mask overly frequent Sparsemax features using the running idf_score buffer")
+    ap.add_argument("--sparsemax-no-idf-mask", dest="sparsemax_use_idf_mask", action="store_false",
+                    help="disable Sparsemax frequent-feature mask even if config enables it")
+    ap.add_argument("--sparsemax-idf-threshold", type=float, default=c("sparsemax_idf_threshold", 0.1),
+                    help="feature firing-frequency threshold for Sparsemax idf masking")
+    ap.add_argument("--sparsemax-mse-loss-scale", type=float, default=c("sparsemax_mse_loss_scale", 1.0),
+                    help="multiplier on Sparsemax SAE reconstruction MSE")
+    ap.add_argument("--sparsemax-score-scale", type=float, default=c("sparsemax_score_scale", 2.0),
+                    help="fixed scale applied to normalized attention scores before sparsemax")
+    ap.add_argument("--sparsemax-l0-target", type=float, default=c("sparsemax_l0_target", 32.0),
+                    help="target participation-ratio L0 for Sparsemax activations; <=0 disables")
+    ap.add_argument("--sparsemax-l0-coefficient", type=float, default=c("sparsemax_l0_coefficient", 10.0),
+                    help="coefficient for the Sparsemax L0 target loss")
+    ap.add_argument("--sparsemax-cosine-loss-coefficient", type=float, default=c("sparsemax_cosine_loss_coefficient", 0.0),
+                    help="coefficient for activation-direction cosine reconstruction loss")
+    ap.add_argument("--sparsemax-norm-loss-coefficient", type=float, default=c("sparsemax_norm_loss_coefficient", 0.0),
+                    help="coefficient for relative activation-norm reconstruction loss")
+    ap.add_argument("--sparsemax-value-scale-init", type=float, default=c("sparsemax_value_scale_init", 1.0),
+                    help="initial learned per-feature value scale")
+    ap.add_argument("--sparsemax-global-output-scale-init", type=float, default=c("sparsemax_global_output_scale_init", 1.0),
+                    help="initial learned scalar output scale")
+    ap.add_argument("--sparsemax-init-b-dec-from-data", dest="sparsemax_init_b_dec_from_data", action="store_true",
+                    default=bool(c("sparsemax_init_b_dec_from_data", False)),
+                    help="initialize Sparsemax decoder bias from activation mean")
+    ap.add_argument("--sparsemax-no-init-b-dec-from-data", dest="sparsemax_init_b_dec_from_data", action="store_false",
+                    help="disable Sparsemax decoder-bias data mean init")
+    ap.add_argument("--sparsemax-b-dec-init-rows", type=int, default=c("sparsemax_b_dec_init_rows", 10000),
+                    help="number of contiguous sampled activation rows for Sparsemax b_dec mean init")
     ap.add_argument("--init", choices=["default", "asi"], default=c("init", "default"),
                     help="asi = Active Subspace Init (OpenMOSS dead-feature fix)")
     ap.add_argument("--lr", type=float, default=c("lr", 1e-4))
@@ -660,6 +841,18 @@ def main() -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.train_gpu)
         print(f"[train] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} (train_gpu)")
 
+    if isinstance(args.matryoshka_widths, str) and args.matryoshka_widths.strip():
+        args.matryoshka_widths = [int(x) for x in args.matryoshka_widths.split(",") if x.strip()]
+    elif not args.matryoshka_widths:
+        args.matryoshka_widths = None
+
+    if args.sparsemax_key_dim is not None and args.sparsemax_key_dim <= 0:
+        args.sparsemax_key_dim = None
+    if args.sparsemax_preselect_k is not None and args.sparsemax_preselect_k <= 0:
+        args.sparsemax_preselect_k = None
+    if args.sparsemax_l0_target is not None and args.sparsemax_l0_target <= 0:
+        args.sparsemax_l0_target = None
+
     if args.smoke:
         args.expansion = 8
         args.k = 32
@@ -671,6 +864,9 @@ def main() -> None:
         args.log_every = 20
         args.no_wandb = True
         args.eval_enabled = False
+        if args.arch == "sparsemax_attention":
+            args.sparsemax_key_dim = args.sparsemax_key_dim or 256
+            args.sparsemax_preselect_k = min(int(args.sparsemax_preselect_k or 512), 512)
 
     train(
         layer=args.layer,
@@ -680,6 +876,23 @@ def main() -> None:
         k=args.k,
         jumprelu_l0_coefficient=args.jumprelu_l0_coefficient,
         jumprelu_l0_warm_up_steps=args.jumprelu_l0_warm_up_steps,
+        matryoshka_widths=args.matryoshka_widths,
+        sparsemax_key_dim=args.sparsemax_key_dim,
+        sparsemax_preselect_k=args.sparsemax_preselect_k,
+        sparsemax_activation_mode=args.sparsemax_activation_mode,
+        sparsemax_use_input_norm=args.sparsemax_use_input_norm,
+        sparsemax_use_idf_mask=args.sparsemax_use_idf_mask,
+        sparsemax_idf_threshold=args.sparsemax_idf_threshold,
+        sparsemax_mse_loss_scale=args.sparsemax_mse_loss_scale,
+        sparsemax_score_scale=args.sparsemax_score_scale,
+        sparsemax_l0_target=args.sparsemax_l0_target,
+        sparsemax_l0_coefficient=args.sparsemax_l0_coefficient,
+        sparsemax_cosine_loss_coefficient=args.sparsemax_cosine_loss_coefficient,
+        sparsemax_norm_loss_coefficient=args.sparsemax_norm_loss_coefficient,
+        sparsemax_value_scale_init=args.sparsemax_value_scale_init,
+        sparsemax_global_output_scale_init=args.sparsemax_global_output_scale_init,
+        sparsemax_init_b_dec_from_data=args.sparsemax_init_b_dec_from_data,
+        sparsemax_b_dec_init_rows=args.sparsemax_b_dec_init_rows,
         init=args.init,
         lr=args.lr,
         total_steps=args.total_steps,

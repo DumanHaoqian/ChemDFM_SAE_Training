@@ -1,0 +1,66 @@
+# Stage 4 SAE training config: Sparsemax Attention SAE v4.
+# v4 adds cosine/norm fidelity losses, best-delta checkpointing, and keeps decoder
+# bias initialization from activation means. This is the first serious run after
+# v3 showed MSE improving while Delta LM loss degraded after early checkpoints.
+
+# ----- training placement -----
+train_gpu: 1            # Physical GPU id used for SAE training; override if occupied.
+
+# ----- output / logging / checkpoints -----
+output_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/output
+log_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/logs
+log_file: null
+checkpoint_dir: /home/haoqian/Data/Graph/SAERAG_Stage4/checkpoints
+ckpt_every: 1000
+
+# ----- W&B -----
+wandb: true
+wandb_project: chem_sae
+wandb_entity: null
+wandb_run_name: null
+
+# ----- Sparsemax Attention SAE architecture / optimization -----
+arch: sparsemax_attention
+layer: 26
+expansion: 8              # 40960 latents: more capacity than the 4x prototype, still cheaper than 16x.
+k: 32                     # Shared metadata only; Sparsemax support is controlled by score_scale + L0 target.
+init: default
+lr: 5.0e-5
+total_steps: 2500
+batch_size: 1024
+train_block_rows: 32768
+decoder_init_norm: 1.0
+dead_window: 2000000
+holdout_rows: 50000
+log_every: 50
+run_name: null
+
+# Sparsemax-specific knobs.
+sparsemax_key_dim: 1024
+sparsemax_preselect_k: 2048       # More candidates for 8x dictionary; sparsemax support remains target-regularized.
+sparsemax_activation_mode: probs
+sparsemax_use_input_norm: true
+sparsemax_use_idf_mask: false
+sparsemax_idf_threshold: 0.1
+sparsemax_mse_loss_scale: 1.0
+sparsemax_score_scale: 4.0        # Restored from prototype; paired with stronger L0 target to prevent collapse.
+sparsemax_l0_target: 32.0         # Participation-ratio L0 target.
+sparsemax_l0_coefficient: 200.0    # Stronger than v3; try to keep support closer to target while preserving fidelity.
+sparsemax_cosine_loss_coefficient: 20.0 # Penalize direction drift, a proxy for LM-sensitive errors.
+sparsemax_norm_loss_coefficient: 5.0    # Penalize activation norm mismatch.
+sparsemax_value_scale_init: 1.0   # Learned per-feature value scale starts neutral.
+sparsemax_global_output_scale_init: 1.0
+sparsemax_init_b_dec_from_data: true
+sparsemax_b_dec_init_rows: 10000
+
+# ----- periodic Delta LM loss eval -----
+eval: true
+eval_gpu: 2
+eval_per_step: 250
+eval_batch_size: 2
+eval_n_eval_seqs: 32
+eval_max_length: 128
+eval_model: chemdfm
+eval_timeout_sec: 3600
+eval_poll_interval: 5.0
+eval_keep_checkpoints: false

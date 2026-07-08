@@ -36,6 +36,14 @@ from data import ActivationStore
 
 
 def load_sae(run_dir: Path, device: str):
+    meta_path = run_dir / "training_meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("arch") == "sparsemax_attention":
+            from sparsemax_attention_sae import SparsemaxAttentionSAE
+
+            return SparsemaxAttentionSAE.load_from_disk(run_dir, device=device)
+
     from sae_lens import SAE
 
     sae = SAE.load_from_disk(str(run_dir))
